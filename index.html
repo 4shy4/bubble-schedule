@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0b1020" />
+<title>气泡日程 · Bubble Schedule Demo</title>
+<meta name="description" content="气泡浮动日程界面：大小 = 还剩多久，颜色 = 事情多大。纯前端、零依赖。" />
+<!-- 空的 data: 图标：不写这一行浏览器会去请求 /favicon.ico 并拿到 404，
+     在控制台留一条无意义的红字（demo 的 404 检查也会被它干扰）。 -->
+<link rel="icon" href="data:," />
+<!--
+  刻意复用应用的**同一批样式表**（web/css/*.css 由生成器拷进来）。
+  少一个气泡就长得不对：`.bubble-canvas` 在 views.css，
+  颜色/圆角/字号的设计变量在 base.css。
+-->
+<link rel="stylesheet" href="web/css/base.css" />
+<link rel="stylesheet" href="web/css/layout.css" />
+<link rel="stylesheet" href="web/css/views.css" />
+<link rel="stylesheet" href="web/css/components.css" />
+<link rel="stylesheet" href="web/demo.css" />
+</head>
+<body>
+<!--
+  ⚠️ `view-bubble` 这个类**不能省**：layout.css 里气泡区的"铺满"规则
+     （去掉顶栏、去掉内容区内边距、把 .content 变成 flex 列）全部挂在
+     `.app.view-bubble` 下面。少了它就不是全屏气泡，而是带一圈留白的普通视图。
+
+  ⚠️ 也**不能有 .sidebar**：layout.css 的 `.app` 是
+     `display:grid; grid-template-columns: var(--sidebar-w) 1fr`。
+     没有侧栏时，`.main` 会落进**第一列**（= 收起态侧栏的 62px），
+     整个主区被压成 62px 宽 —— 实测就是 62px。
+     demo.css 里用 `grid-template-columns: 1fr` 覆盖掉。
+-->
+<div class="app view-bubble">
+  <div class="main">
+    <main class="content" id="view-host" tabindex="-1"></main>
+  </div>
+</div>
+
+<!-- 顶部悬浮条：标题 / 统计 / 两个好玩的操作（重排、暂停漂浮）。
+     不用应用的 .topbar —— 气泡视图下它是被隐藏的（空间全留给气泡），
+     所以这里自己做一条浮层。 -->
+<div class="demo-bar">
+  <b id="view-title">气泡面板</b>
+  <span id="view-subtitle" class="demo-sub"></span>
+  <span class="demo-nav" id="view-nav"></span>
+</div>
+
+<div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="false"></div>
+
+<div class="demo-hint">
+  <b>怎么玩</b> ·
+  拖动气泡挪开 ·
+  单击 = 编辑 ·
+  <b>双击</b> = 进去（套娃）·
+  <b>长按 2.5 秒</b> = 戳破 ·
+  单击空白 = 新建 ·
+  右下角 <b>?</b> 展开说明
+</div>
+
+<script type="module" src="web/demo.js"></script>
+</body>
+</html>

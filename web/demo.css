@@ -1,0 +1,89 @@
+/* demo 专有的少量样式 —— 其余全部复用应用真实的 web/css/*.css。
+   这里只做四件事：撑满高度、修掉 grid 列、加悬浮标题条、加玩法提示。 */
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #0b1020;
+}
+
+/* ⚠️ 关键修复。layout.css 的 `.app` 是
+     display: grid; grid-template-columns: var(--sidebar-w) 1fr;
+   那是给"侧栏 + 主区"两列用的。demo 没有侧栏，于是 `.main` 会落进
+   **第一列**（收起态侧栏 62px），主区被压成 62px 宽、气泡画布也跟着塌掉。
+   （layout.css 自己的注释里就记着同一个坑，只是那是侧栏 absolute 造成的。）
+   这里把列数改成一列，让主区独占。 */
+.app {
+  grid-template-columns: 1fr;
+  height: 100vh;
+  height: 100dvh;
+}
+
+/* 顶部悬浮条：取代被隐藏的 .topbar */
+.demo-bar {
+  position: fixed;
+  top: 10px;
+  left: 12px;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  max-width: calc(100vw - 24px);
+  padding: 7px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+  color: #cbd5e1;
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  backdrop-filter: blur(6px);
+  pointer-events: auto;
+}
+
+.demo-bar b { color: #e2e8f0; }
+.demo-sub { color: #94a3b8; }
+
+.demo-nav {
+  display: flex;
+  gap: 6px;
+  margin-left: 4px;
+}
+
+/* 复用应用的按钮样式，但在深色浮层上要把文字提亮一点 */
+.demo-nav .btn {
+  background: rgba(148, 163, 184, 0.14);
+  border-color: rgba(148, 163, 184, 0.3);
+  color: #e2e8f0;
+}
+.demo-nav .btn:hover {
+  background: rgba(148, 163, 184, 0.24);
+  color: #fff;
+}
+
+/* 左下角的玩法提示 */
+.demo-hint {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 50;
+  max-width: min(600px, calc(100vw - 24px));
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #cbd5e1;
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+}
+
+.demo-hint b { color: #e2e8f0; }
+
+@media (max-width: 560px) {
+  .demo-hint { font-size: 11px; padding: 6px 9px; }
+  .demo-bar { font-size: 12px; padding: 6px 9px; }
+}
