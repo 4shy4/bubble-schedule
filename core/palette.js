@@ -102,6 +102,40 @@ export function tierTextColor(key) {
   return luminance(tierByKey(key).color) > 0.45 ? 'rgba(22, 28, 42, 0.94)' : '#ffffff';
 }
 
+/**
+ * 「过期」的两种紫。
+ *
+ * ⚠️ 这两个值原来只写在 `web/ui/views/bubble.js` 里。现在搬到 palette，
+ *    因为 **Windows 桌面泡泡也要画"过期"** —— 同一个语义留两份颜色，
+ *    迟早会出现"网页上是暗紫、桌面上是别的紫"这种没人想到去查的差异。
+ *   · `OVERDUE_COLOR`：自己过期时的泡体色（暗紫）
+ *   · `OVERDUE_EDGE`：过期的边缘/刺（亮一点的紫）
+ */
+export const OVERDUE_COLOR = '#5b2a6e';
+export const OVERDUE_EDGE = '#7c3aed';
+
+/** `#rgb` / `#rrggbb` → [r, g, b] */
+export function rgbOf(hex) {
+  let h = String(hex).replace('#', '');
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  const n = parseInt(h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+/**
+ * 线性混合两色（玻璃感需要"往白里混"而不是单纯调透明度）。
+ *
+ * ⚠️ 原来这是 `web/ui/views/bubble.js` 里的私有函数。桌面泡泡要画同一个"泡体"
+ *    （往白里混 42% 当受光面、往深里混 45% 当背光面），所以搬进 palette 共用 ——
+ *    否则两边的"球体感"会不知不觉长得不一样。
+ */
+export function mixColor(a, b, t) {
+  const pa = rgbOf(a); const pb = rgbOf(b);
+  const k = Math.max(0, Math.min(1, t));
+  const out = [0, 1, 2].map((i) => Math.round(pa[i] + (pb[i] - pa[i]) * k));
+  return `#${out.map((c) => c.toString(16).padStart(2, '0')).join('')}`;
+}
+
 export function hexToRgba(hex, alpha = 1) {
   const h = String(hex).replace('#', '');
   const full = h.length === 3 ? h.split('').map((c) => c + c).join('') : h;

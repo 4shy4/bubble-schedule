@@ -301,6 +301,20 @@ textarea.code { font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
 .bubble-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 
 
+.bubble-wrap,
+.bubble-stage,
+.bubble-canvas {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+.bubble-wrap input,
+.bubble-wrap textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+
 .bubble-stage {
   position: relative;
   flex: 1;
@@ -314,6 +328,25 @@ textarea.code { font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
 }
 .bubble-canvas { display: block; position: absolute; inset: 0; cursor: grab; touch-action: none; }
 .bubble-canvas.grabbing { cursor: grabbing; }
+
+
+.bubble-tap-ripple {
+  position: absolute;
+  width: 34px;
+  height: 34px;
+  margin: -17px 0 0 -17px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--brand) 70%, transparent);
+  background: color-mix(in srgb, var(--brand) 16%, transparent);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+.bubble-tap-ripple.on { animation: bubble-tap-ripple 420ms ease-out; }
+@keyframes bubble-tap-ripple {
+  0% { opacity: .85; transform: scale(.45); }
+  100% { opacity: 0; transform: scale(1.5); }
+}
 
 
 .bubble-stage.bubble-inside {
@@ -415,6 +448,8 @@ textarea.code { font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
 .bubble-hud-chip b { font-weight: 650; }
 .bubble-hud-chip.muted { color: var(--muted); }
 
+.bubble-hud-chip[hidden] { display: none; }
+
 
 .bubble-panel {
   position: absolute; left: 0; right: 0; bottom: 0; z-index: 5;
@@ -437,6 +472,12 @@ textarea.code { font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
 .bubble-panel-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .bubble-panel-row .spacer { flex: 1; }
 .bubble-tool-label { font-size: 12px; color: var(--muted); }
+
+.bubble-horizon-input {
+  width: 62px; padding: 4px 6px; font-size: 12.5px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--text);
+}
 .bubble-help-head { display: flex; flex-direction: column; gap: 2px; }
 .bubble-help-head strong { font-size: 14px; font-weight: 650; }
 .bubble-help-title {
@@ -785,3 +826,11 @@ pre.code-block {
 .recycle-badge.early { color: var(--ok); }        
 .recycle-badge.late  { color: var(--warn); }      
 .recycle-when { font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.month-cell .cell-lunar { font-size: 10px; color: var(--muted); margin-left: auto; }
+.month-cell .cell-festival {
+  font-size: 11px; font-weight: 600; color: #e03a3a;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.month-cell.has-festival { box-shadow: inset 0 0 0 1px color-mix(in srgb, #e03a3a 35%, transparent); }
+.month-cell.has-festival .daynum { color: #e03a3a; }

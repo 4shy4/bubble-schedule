@@ -70,10 +70,19 @@ export function minutesOfDay(d) {
 }
 
 /** 相对日期描述：今天 / 明天 / 周三 / 3月5日 */
-export function friendlyDay(d) {
+/**
+ * 「今天 / 明天 / 后天 / 周四 / 9月24日」。
+ *
+ * ⚠️ `today` 参数是**为了能钉住时间**（默认还是真实时钟，老调用方不受影响）。
+ *    踩过的坑：core/share-plan.js 用 `opts.now` 算窗口，表头却调这里的默认真实时钟 ——
+ *    于是 `buildSharePlan(events, { now: 某个固定时刻 })` 出来的表头**和窗口不一致**，
+ *    对应的单测也只能"碰运气通过"（真实日期一走远就红）。
+ *    凡是"算一段时间的文本"，都必须把同一个 now 传到底。
+ */
+export function friendlyDay(d, today = new Date()) {
   const x = startOfDay(d);
-  const today = startOfDay(new Date());
-  const diff = Math.round((x - today) / DAY_MS);
+  const t0 = startOfDay(today);
+  const diff = Math.round((x - t0) / DAY_MS);
   if (diff === 0) return '今天';
   if (diff === 1) return '明天';
   if (diff === 2) return '后天';

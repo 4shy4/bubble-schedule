@@ -117,6 +117,58 @@ export function effectiveReminders(ev, now = new Date()) {
   return notificationPlanForRemaining(remaining).plan;
 }
 
+/**
+ * 「未来泡泡」现在该不该出现。
+ *
+ * 用户定义的语义（原话确认过）：
+ *   · `future：true` 时，**`start` = 泡泡出现的日子**（不是"开始做"的时刻）
+ *   · 到 `start` 之前，这颗泡泡**只在气泡区不显示** —— 列表/月历/周课表照常显示它
+ *     （用户明确选了这一条：气泡区是"眼前该管的"，列表是全部账本）
+ *   · 到了 `start` 那天就照常出现，然后按剩余时间倒计时到 `end`
+ *
+ * 为什么这条判定放在 core 而不是写在 bubble.js 里：
+ *   它是**事件模型的语义**（和 deadline/isOverdue 同一层），必须能被单元测试直接钉住；
+ *   气泡区只是它的第一个使用者，将来列表要加"未来"角标也得用同一份判定。
+ */
+export function isNotYetVisible(ev, now = new Date()) {
+  if (!ev || ev.future !== true) return false;
+  const t = new Date(ev.start).getTime();
+  if (!Number.isFinite(t)) return false;              // 没填时间的脏数据 → 当作可见，别把泡泡藏没了
+  return t > new Date(now).getTime();
+}
+
+/**
+ * 这一颗的**祖先容器**里有没有过期的（**不看它自己**）。
+ *
+ * ⚠️⚠️ 这个函数是为用户报的"**为啥又一圈紫色的齿轮**"补的，别把它和
+ * `isOverdueEvent` 混用 —— 二者差一个维度，混用就会出现自相矛盾的界面：
+ *
+ *   · `isOverdueEvent(ev)` 问的是"**这条日程**到期了吗"，
+ *     而它用的是 `ev.deadline || ev.end || ev.start`，也就是**第一次发生**那个期限。
+ *   · 重复日程的**本次发生**用的是 `item.deadline`（见 core/recurrence.js 的
+ *     occurrenceDeadline：把"开始→截止"这段关系平移到这次发生上）。
+ *
+ *   于是一颗"上周建的、每周重复"的日程：base 期限在上周（早过了），
+ *   而本周/下周那两颗的期限都在将来 —— 渲染层却拿 `isOverdueEvent` 当
+ *   "容器过期"的判据，就把这两颗**将来的**泡泡画成了"容器过期"，
+ *   即那圈暗紫虚线环（用户看到的"紫齿轮"），而泡泡上的字明明写着"剩余 N 天"。
+ *
+ *   所以要判"继承来的过期"，只能**沿 parentId 往上问**，不能拿自己的期限凑。
+ */
+export function inheritedOverdueOf(ev, allEvents, now = new Date()) {
+  if (!ev || !Array.isArray(allEvents)) return false;
+  let cur = ev.parentId ? allEvents.find((e) => e.id === ev.parentId) : null;
+  let guard = 0;
+  while (cur && guard < 32) {
+    // 用 `isOverdueEvent` 而不是只看它自己的 remaining：
+    // 祖父过期时父级也是"有效过期"，只要链上有任意一层过期就算。
+    if (isOverdueEvent(cur, allEvents, now)) return true;
+    cur = cur.parentId ? allEvents.find((e) => e.id === cur.parentId) : null;
+    guard += 1;
+  }
+  return false;
+}
+
 /** 事件当前的紧急档位（调试面板 / 图例 / 服务端调度器都要） */
 export function bandForEvent(ev, now = new Date()) {
   const remaining = remainingMsOf(ev, now);
@@ -369,6 +421,11 @@ export function updateSettings(db, patch) {
   const prev = db.settings || {};
   const next = { ...prev, ...patch };
   if (patch.notify) next.notify = { ...(prev.notify || {}), ...patch.notify };
+  // ⚠️ `bubbleView` 是第二个要**逐字段合并**的嵌套对象（同上那条 notify 的坑）：
+  //    网页气泡区只改"显示课程"时不该把"时间范围"冲回默认值。
+  //    而且它是**两端共用**的一份显示设置（网页 + Windows 桌面气泡层），
+  //    所以更要按字段合并 —— 被冲掉的症状是"桌面上突然多/少了几颗"，很难联想到设置合并。
+  if (patch.bubbleView) next.bubbleView = { ...(prev.bubbleView || {}), ...patch.bubbleView };
   db.settings = next;
   return db.settings;
 }
@@ -477,6 +534,35 @@ export function upsertEvent(db, input, now) {
       : (Array.isArray(input.reminders) ? input.reminders.map(Number) : (db.settings && db.settings.defaultReminders) || [10, 0]),
     tags: Array.isArray(input.tags) ? input.tags : [],
     done: !!input.done,
+    // alarm：**这条日程要不要用真闹钟**（AlarmKit，iOS 26+）。
+    //
+    // ⚠️ 为什么必须有这个**按日程**的开关（只有全局设置不够）：
+    //   提醒**强度**是按"还剩多久"自动算的（core/level.js 的 BAND_INTENSITY）：
+    //   最后一小时/过期会到最高档；而最高档在 iOS 上会被做成**真闹钟** ——
+    //   而真闹钟**穿专注模式**（那是它的定义，改不了）。
+    //   若只有全局开关，用户就只剩两个选择：全都用（专注模式废掉）、
+    //   或全都不用（等于白接 AlarmKit）。用户的真实要求是"专注时别响"，
+    //   同时"绝对不能错过的事要能炸到人" —— 那就只能**按日程**决定。
+    //   默认 false：**不勾就永远不会炸**；勾了才是"我认了它会穿过专注模式"。
+    alarm: input.alarm === true,
+    // periodDays：「周期（天）」—— 重复日程只浮「第一颗 + 周期」以内的实例。
+    //
+    // ⚠️⚠️ 这里曾经**漏了它**，于是编辑器里填的"周期"**存不进去**。用户实测表现为：
+    //   · 编辑周期**无效**（重开一看还是旧值）
+    //   · **超限的泡泡不消失**（core/recurrence.js 的 periodDaysOf → applyPeriodLimit 读不到它）
+    //   根因和 `alarm` 那次一模一样：**这个 base 是"逐字段列举"的，
+    //   不在这里写一句就会被静默丢掉，而且哪儿都不报错。**
+    //   归一化方式**照抄 editor.js 的写入端**（空 → null；否则取整、最小 1），
+    //   别在这里发明第二套规则。
+    periodDays: (input.periodDays == null || input.periodDays === '')
+      ? null
+      : Math.max(1, Math.floor(Number(input.periodDays) || 1)),
+    // future：「未来泡泡」—— `start` 的含义变成**出现日期**（到那天之前只在气泡区不显示），
+    //   `end` 就是到期，提醒也改按 `end` 算（见 core/notify-plan.js 的锚点说明）。
+    //
+    // ⚠️ 同样是**枚举字段**，不在这里写一句就会被静默丢掉（表现又是"编辑无效"）。
+    //    这一条现在由 tools/ios-bundle-check.mjs 的"编辑器 payload ⊆ base"检查自动盯着。
+    future: input.future === true,
     createdAt: at,
     updatedAt: at,
   };

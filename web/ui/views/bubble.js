@@ -9,14 +9,16 @@
 //       采用"转向"而不是"撞墙"来处理边界，避免气泡堆在边上。
 // 碰撞：刚体弹开 + 弹性形变（沿碰撞法线挤扁、垂直方向拉长，然后弹回）。
 import { el, mount } from '../dom.js';
-import { expandRange, applyPeriodLimit } from '../../../core/recurrence.js';
+// 「哪些实例该浮出来」的规则本体在 core（**桌面泡泡共用同一份**，别在这里再写一遍）。
+// `isRepeating` 也一起从那儿拿 —— 本文件原来自己定义了一份，属于同一个坑的种子。
+import { selectBubbleItems, isRepeating, BUBBLE_VIEW_DEFAULTS } from '../../../core/bubble-select.js';
 // 「到期/过期」只有一个定义在 core/state-ops.js（方案 C：到期 = 结束时间）
 import * as stateOps from '../../../core/state-ops.js';
-import { addDays, asDate, hhmm, startOfDay, toDateKey } from '../../../core/time.js';
+import { asDate, hhmm } from '../../../core/time.js';
 import {
   URGENCY_TIERS, tierByKey, tierFill, tierTextColor,
   radiusRangeForCanvas, areaScaleForCanvas, RADIUS_MIN_FLOOR,
-  hexToRgba, luminance,
+  hexToRgba, luminance, mixColor, OVERDUE_COLOR, OVERDUE_EDGE,
 } from '../../../core/palette.js';
 import { bubbleStyle, levelOf } from '../../../core/urgency.js';
 import {
@@ -41,6 +43,8 @@ const SHOW_DONE_KEY = 'timetable.bubble.showDone';
  * 给个开关，默认**显示**（不改变现有行为，用户自己勾掉）。
  */
 const SHOW_COURSE_KEY = 'timetable.bubble.showCourse';
+// 节日气泡：还剩几天时浮出来（用户定的默认 4 天，可调；0 = 不显示）
+const FESTIVAL_DAYS_KEY = 'timetable.bubble.festivalDays';
 
 /** 长按多久算"戳破"（用户指定 2.5 秒） */
 const LONG_PRESS_MS = 2500;
@@ -63,8 +67,7 @@ const SQUASH_DAMPING = 0.22; // 阻尼（越小越快停下来，减少来回晃
 const RADIUS_EASE = 6;       // 半径变化速度（1/s）：剩余时间在走，半径要平滑长大
 
 // ---------- 过期气泡：定点不动 + 暗紫 + 长刺 ----------
-const OVERDUE_COLOR = '#5b2a6e';      // 暗紫
-const OVERDUE_EDGE = '#7c3aed';
+// ⚠️ 两个紫色从 core/palette.js 引入（**桌面泡泡也要画过期**，同一个语义别留两份颜色）
 const OVERDUE_SPIKES = 13;            // 一圈多少根刺
 const OVERDUE_SPIKE_LEN = 0.16;       // 刺长（相对半径）
 
@@ -130,8 +133,24 @@ export const bubbleView = {
     // 原来的 ＋（新建）和 ⚙（设置）都撤了（用户要求）：
     //   · 新建 → 改成**单击空白背景**（和子母泡泡的逻辑一致）
     //   · 设置 → 合进说明面板，点 ? 展开
-    const pickChip = el('span.bubble-hud-chip.muted', { text: hudHint(state) });
+    // 空文字时这一格会整格收起来（见 setHudChip 的说明）
+    const pickChip = el('span.bubble-hud-chip.muted', { hidden: true });
+    // 最外层 `hudHint()` 是空串 → 保持隐藏；进了容器就有话要说 → 显示
+    setHudChip(pickChip, hudHint(state));
     const tally = el('span.bubble-hud-chip.muted');
+    /**
+     * 「点到了」的即时反馈（一圈扩散的涟漪）。
+     *
+     * 为什么要有它（不是装饰）：
+     *   单击背景要等一个**双击窗口**（340ms）才能决定是"加子泡泡"还是"出去"，
+     *   所以按下到有反应之间天然有一段静默期。用户按完没看到任何变化，
+     *   会以为"这个 App 没反应"，然后再点一次 —— 恰好被当成双击，于是**退出一层**，
+     *   更加确信"点了乱跳"。涟漪把这段静默期填上：**按下去就有东西动**。
+     *
+     * 它顺带还是个诊断器：如果按背景连通涟漪都不出现，那就是手势根本没进到画布，
+     * 不用再猜业务逻辑（iPad 上排查"单击背景无响应"就靠这个分叉）。
+     */
+    const tapRipple = el('div.bubble-tap-ripple');
     const backBtn = el('button.icon-btn.bubble-hud-btn', {
       type: 'button', title: '退出一层（也可以双击背景）', 'aria-label': '退出一层', text: '↩',
     });
@@ -208,14 +227,32 @@ export const bubbleView = {
 
     // 说明面板：点 ? 才出现（默认隐藏，不占版面）
     const panel = el('div.bubble-panel.bubble-help', { hidden: true });
-    const stage = el('div.bubble-stage', {}, [canvas, insideHint, hud, panel, dropzoneEl]);
+    const stage = el('div.bubble-stage', {}, [canvas, tapRipple, insideHint, hud, panel, dropzoneEl]);
     const legend = el('div.bubble-legend');
 
     // 进入气泡后：容器变成这层画布的背景色（视觉上"我们在这个气泡里面"）
     applyStageBackground(stage, state);
 
-    const local = { selected: null, panel, legend, config, pickChip, setDropMode, dropzoneEl };
-    renderPanel(panel, legend, config, ctx, local);
+    // ⚠️ tapRipple 必须放进 `local` 传给 startSimulation —— 手势处理器（onDown/onUp）
+    //    住在 startSimulation 里，**不在 render 的作用域内**。
+    //    第一版直接引用这个 const，于是 pointerdown 一进 showTapRipple 就
+    //    `ReferenceError: tapRipple is not defined`：涟漪不出现（这一层看得出来），
+    //    但下面的 `local.setSelected(null)` 也被跳过，整条背景点击路径**没有报错、
+    //    看着还"能工作"**（气泡照样加得出来）—— 正是那种最难发现的半坏。
+    const local = { selected: null, panel, legend, config, pickChip, setDropMode, dropzoneEl, tapRipple };
+    // ⚠️⚠️ `state` 必须传进去 —— 这是用户报的"**单击母气泡背景加不了子泡泡**"的真根因。
+    //
+    //    `renderPanel` 的函数体里有两处自由变量 `state`（`hudHint(state)` /
+    //    `isOverdueContainer(state)`），而它的形参里**没有 state**。
+    //    JS 不会在定义时报错，只在**调用那一刻**抛 `ReferenceError: state is not defined`：
+    //      · `setSelected(null)` 在 pointerdown 里抛 → 被浏览器吞掉（控制台有，界面上没有）
+    //      · `local.isOverdueContainer()` 在**340ms 的 setTimeout 回调里**抛 →
+    //        连控制台都不一定看得到，而它后面那句 `ctx.addChild()` **永远不会执行**。
+    //    表现就是"单击背景一点反应都没有"：没有编辑框、没有报错、没有 toast。
+    //    **只有"在容器里"这一支会走到它** —— 最外层走的是 `ctx.newEventAt()`，
+    //    所以"单击空白新建日程"一直是好的，这也正是它长期没被发现的原因
+    //    （所有旧测试都只在最外层点过背景）。
+    renderPanel(panel, legend, config, ctx, local, state);
 
     helpBtn.addEventListener('click', () => {
       panel.hidden = !panel.hidden;
@@ -278,7 +315,16 @@ let bubblePathIds = (() => {
  */
 function pruneBubblePath(events) {
   if (!bubblePathIds.length) return false;
-  const ids = new Set((events || []).map((e) => e.id));
+  // ⚠️ **没有校验依据时不要做破坏性修剪。**
+  //    这一条是跑真触摸测试时发现的：App 起来会先用**本机缓存**渲染一次
+  //    （store.init 里先 cache 后 network，而 subscribe 早就挂上了）。
+  //    如果缓存里恰好还没有那个容器（比如刚在别处建的、或缓存是旧的），
+  //    这里就会把用户的"我在第几层"**当成幽灵路径砍掉** —— 等他双击进去、
+  //    刷新一次，人就莫名其妙回到了最外层。
+  //    空列表时什么都不砍：真要是有幽灵 id，后面还有两道防线
+  //    （渲染时 `insideParent` 找不到 → 画空状态；服务端会丢弃失效的 parentId）。
+  if (!Array.isArray(events) || !events.length) return false;
+  const ids = new Set(events.map((e) => e.id));
   const keep = [];
   for (const id of bubblePathIds) {
     if (!ids.has(id)) break;
@@ -429,38 +475,147 @@ function isOverdueContainer(state) {
 
 function readConfig() {
   return {
-    horizonDays: Number(localStorage.getItem(HORIZON_KEY) || 14),
+    horizonDays: Number(localStorage.getItem(HORIZON_KEY) || BUBBLE_VIEW_DEFAULTS.horizonDays),
     showDone: localStorage.getItem(SHOW_DONE_KEY) === '1',
     // 没设过就是显示（保持老行为）
     showCourse: localStorage.getItem(SHOW_COURSE_KEY) !== '0',
+    festivalDays: (() => {
+      const raw = localStorage.getItem(FESTIVAL_DAYS_KEY);
+      if (raw === null) return BUBBLE_VIEW_DEFAULTS.festivalDays;
+      const n = Number(raw);
+      return Number.isFinite(n) && n >= 0 ? Math.min(60, Math.floor(n)) : BUBBLE_VIEW_DEFAULTS.festivalDays;
+    })(),
   };
 }
 
 /**
- * 实例账本的键（'YYYY-MM-DD'，**本地**日期）。
+ * 「电脑桌面气泡区」那一块设置（用户要的软件入口）。
  *
- * ⚠️ 必须和服务端 `store.occurrenceKey` 用同一套（本地日期，不是 UTC）。
- *    用 `toISOString().slice(0,10)` 会在东八区把"周一早上 7 点"算成前一天。
+ * ⚠️ 这一层是**本机的一个 Windows 程序**（不是网页的一部分），所以：
+ *   · 状态要从服务端问（`/api/desktop-layer`）—— 只有 PC 版有，别的端 404；
+ *   · 开/关也是让**服务端**去启动/结束那个进程（浏览器做不到这件事）。
+ *
+ * ⚠️ `desktopLayerState` 的三态要分清楚：
+ *   `undefined` = 还没问过（先别画，问完再 rerender）
+ *   `null`      = 这一端没有这个功能（平板上就是这种）→ 整块不出现
+ *   对象        = 有，照它画
  */
-function occurrenceKeyOf(date) {
-  const d = date instanceof Date ? date : new Date(date);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+let desktopLayerState;
+let desktopLayerAsked = false;
+
+function desktopLayerBlock(rerender) {
+  // ⚠️ 公开 demo（public/bubble-demo）用的是一份**内存版 store**，
+  //    上面根本没有这两个函数 —— 不先看一眼的话，这里一个 TypeError
+  //    就会把整个气泡区的渲染打断（表现是白屏）。有的话才去问。
+  if (typeof store.desktopLayerStatus !== 'function') { desktopLayerState = null; return []; }
+  if (!desktopLayerAsked) {
+    desktopLayerAsked = true;
+    Promise.resolve(store.desktopLayerStatus())
+      .then((st) => { desktopLayerState = st || null; if (st) rerender(); })
+      .catch(() => { desktopLayerState = null; });
+  }
+  const st = desktopLayerState;
+  if (!st) return [];
+
+  const act = (action, on, okText) => {
+    if (typeof store.desktopLayerAct !== 'function') return;
+    Promise.resolve(store.desktopLayerAct(action, on))
+      .then((r) => {
+        if (r && r.status) desktopLayerState = r.status;
+        if (r && r.ok === false) toast({ title: '没做成', body: r.error || '未知原因', kind: 'err', timeout: 4000 });
+        else if (okText) toast({ title: okText, timeout: 1500 });
+        rerender();
+      })
+      .catch((err) => toast({ title: '没做成', body: err.message, kind: 'err', timeout: 4000 }));
+  };
+
+  return [
+    el('div.bubble-help-title', { text: '电脑桌面气泡区' }),
+    el('div.bubble-panel-row', {}, [
+      el('span.bubble-tool-label', { text: st.running ? '正在桌面上显示' : '没开' }),
+      el('button.btn.btn-sm', {
+        text: st.running ? '关掉它' : '显示到桌面',
+        title: st.built ? '在桌面上画出气泡区（一个本机小窗口）' : '第一次会自动编译，可能要几秒',
+        onclick: () => act(st.running ? 'stop' : 'start', undefined, st.running ? '已关掉' : '已经放到桌面上'),
+      }),
+      st.running ? el('span.bubble-tool-label', { text: '（在系统托盘图标上右键也有同样的菜单）' }) : null,
+    ].filter(Boolean)),
+    el('label.switch-row.bubble-course-toggle', {}, [
+      el('span', { text: '浮在所有窗口之上' }),
+      el('input', {
+        type: 'checkbox',
+        checked: st.topmost,
+        onchange: (e) => act('topmost', e.target.checked, e.target.checked ? '已置顶' : '改成只在桌面显示'),
+      }),
+    ]),
+    el('label.switch-row.bubble-course-toggle', {}, [
+      // ⚠️ 代价直接写在标签里：打开之后**整屏都吃点击**（除任务栏），桌面就点不动了。
+      el('span', { text: '空白处也吃点击（桌面暂时点不动，任务是：托盘还能点）' }),
+      el('input', {
+        type: 'checkbox',
+        checked: st.captureBackground,
+        onchange: (e) => act('capture', e.target.checked, e.target.checked ? '已打开：现在在桌面空地上单击就能新建' : '已关掉：桌面又能点了'),
+      }),
+    ]),
+    st.captureBackground
+      ? el('div.bubble-panel-row', {}, [
+        el('span.bubble-tool-label', {
+          text: '⚠️ 开着"空白处也吃点击"时桌面点不动（任务栏除外）—— 想改回来就在桌面那个小窗口的托盘图标上右键',
+        }),
+      ])
+      : null,
+    el('label.switch-row.bubble-course-toggle', {}, [
+      el('span', { text: '开机自动显示' }),
+      el('input', {
+        type: 'checkbox',
+        checked: st.autostart,
+        onchange: (e) => act('autostart', e.target.checked, e.target.checked ? '已设为开机自启' : '已取消开机自启'),
+      }),
+    ]),
+  ].filter(Boolean);
 }
 
 /**
- * 这个事件是不是"重复事件"。
+ * 把"气泡区显示设置"同步给服务端 —— **Windows 桌面气泡层读的就是这一份**。
  *
- * ⚠️ 不能只看 `freq !== 'none'` 就下结论：单次日程的 `recurrence.freq` 是 `'none'`，
- * 但课表课程用的是 `weeks`（没有 freq）。两者都要算"会展开出多个实例"。
- * 只有**会展开出多个实例**的事件才需要在气泡上标"周几"。
+ * 用户第 41 轮的原话是"桌面气泡的显示与软件气泡区设置保持一致"。
+ * 网页这边的真值在 localStorage（每台设备自己记），原生那侧**读不到浏览器的 localStorage**，
+ * 所以每次渲染时把这三个数推给服务端（`settings.bubbleView`），桌面那侧读服务端。
+ *
+ * ⚠️ 已经在服务端存着的值**不要重复写**：这段代码在每次渲染时都会跑，
+ *    不加这个判断就会变成"每渲染一次写一次盘"（还带一次 setState → 再渲染一轮）。
+ * ⚠️ 写失败**不要抛**：这只是"把显示偏好同步过去"，失败了桌面那侧退回默认值，
+ *    不该让气泡区因为一个偏好同步而报错（离线模式下它本来就会进 outbox）。
  */
-function isRepeating(ev) {
-  if (!ev) return false;
-  const rec = ev.recurrence || {};
-  if (rec.freq && rec.freq !== 'none') return true;
-  if (Array.isArray(ev.weeks) && ev.weeks.length) return true;
-  return false;
+function syncBubbleView(config, state) {
+  const cur = (state && state.settings && state.settings.bubbleView) || {};
+  const curView = {
+    horizonDays: Number(cur.horizonDays) || BUBBLE_VIEW_DEFAULTS.horizonDays,
+    showCourse: cur.showCourse !== false,
+    showDone: cur.showDone === true,
+  };
+  if (curView.horizonDays === Number(config.horizonDays)
+    && curView.showCourse === config.showCourse
+    && curView.showDone === config.showDone) return;
+  try {
+    Promise.resolve(store.saveSettings({
+      bubbleView: {
+        horizonDays: Number(config.horizonDays),
+        showCourse: !!config.showCourse,
+        showDone: !!config.showDone,
+      festivalDays: Number(config.festivalDays) || 0,
+      },
+    })).catch(() => { /* 同步失败不影响气泡区 */ });
+  } catch { /* 同上 */ }
 }
+
+/**
+ * ⚠️ 原来这里有一份本文件自己的 `occurrenceKeyOf` 和 `isRepeating`，现在都搬走了：
+ *   · "已经被戳破的那一颗要不要跳过"随选择规则一起进了 `core/bubble-select.js`
+ *     （它用 core/state-ops.js 的 `occurrenceKey` —— 那边才是服务端同一份）
+ *   · `isRepeating` 从 core 引入（同一个判断留两份，迟早会出现
+ *     "网页上标了周几、桌面上没标"这种没人会想到去查的差异）
+ */
 
 /**
  * 这个事件的实例会不会**有多颗同时存在**（也就是"重复"到需要区分是哪一天）。
@@ -475,128 +630,26 @@ function showsWeekday(item) {
 
 function selectItems(state) {
   const config = readConfig();
-  const now = new Date();
-  const from = startOfDay(now);
-  const to = addDays(from, config.horizonDays);
-  const parentId = currentParentId();
-
-  // 套娃：只显示"当前容器里的气泡"。最外层只显示没有父级的。
-  // 注意容量：容器里也可能有很多条，仍受 horizonDays 限制（当前层用的是各自的时间窗口）。
-  let visible = state.events.filter((ev) => (ev.parentId || null) === parentId);
-
-  // 课程是周期性的：一学期几十节，全丢进气泡区会挤爆、还到处乱蹦。
-  // 勾掉就用气泡区只管"临时事务"（用户的原话：气泡区更像临时性时间缓冲区）。
-  if (!config.showCourse) {
-    visible = visible.filter((ev) => ev.type !== 'course');
-  }
-
-  // ---- 展开窗口 ----
-  //
-  // ⚠️ 起点必须**往前推**，不能是"今天 0 点"。
-  //    用户要的是"没戳破的旧实例一直留着当紫泡泡（癌细胞）" ——
-  //    如果只从今天开始展开，历史实例根本不会生成，"堆积"就看不见了。
-  //
-  // 上限 180 天：免得一个很老的日级事件展开出上千个实例。
-  // 早于**事件自身开始时间**的实例在下面被丢掉（那时它还不存在）。
-  const LOOKBACK_DAYS = 180;
-  const raw = expandRange(
-    visible,
-    new Date(from.getTime() - LOOKBACK_DAYS * 86_400_000),
-    // 未来窗口也用**用户选的范围**（那是"预览多远"，不是过滤器）
-    new Date(to.getTime() - 1),
-    state.settings.termStart,
-    (ev) => config.showDone || !ev.done,
-  );
-
-  // 丢掉"早于事件自身开始时间"的实例 —— 展开是往前推的，会生成那时还不存在的实例。
-  const all = raw.filter((it) => {
-    const evStartMs = asDate(it.event.start).getTime();
-    return !Number.isFinite(evStartMs) || it.start.getTime() >= evStartMs - 60_000;
+  // 把这份显示设置推给服务端，桌面气泡层读的就是它（用户要的"两端一致"）
+  syncBubbleView(config, state);
+  // ⚠️ 规则本体已经搬到 core/bubble-select.js —— **桌面泡泡和这里共用同一份**。
+  //    这里只负责把"界面上的选择"喂进去（当前在第几层容器、时间范围、显不显示课程）。
+  //    如果哪天要改"哪些泡泡该浮出来"，改 core 那一份，两处一起变。
+  return selectBubbleItems(state.events, {
+    termStart: state.settings.termStart,
+    parentId: currentParentId(),
+    horizonDays: config.horizonDays,
+    showCourse: config.showCourse,
+    showDone: config.showDone,
+    // 节日气泡（只在最外层、只报重要的、只报快到的）
+    festivalDays: config.festivalDays,
   });
-
-  // ---- 「周期」筛选（用户要的自由度）：只留「第一颗 + 周期」以内的 ----
-  //
-  // 用户原话："对于重复泡泡，用户可选择一个周期（最新任务时间加周期 = 实际显示时间）：
-  //  若泡泡为周级、每周一，周期 3 天，任务还剩四天，原本有俩泡泡（剩四天、剩十一天），
-  //  加周期后第二个就没了；周期改成 8 天又会出来。"
-  //
-  // ⚠️ 位置很重要：必须放在下面那个"最多当前+预备两颗"**之前**。
-  //    否则"周期"只是把本来就只有两颗的列表再筛一遍，
-  //    而用户要的正是"把预备那颗也筛掉" —— 那正是这里的第二颗。
-  // ⚠️ 必须把 `now` 传进去：锚点 = "第一个**未来**的实例"。
-  //    不传的话它会用真实时间，而这个函数上面已经算好了一个 `now`
-  //    （两者在真实运行时几乎一样，但测试/回放时会分叉）。
-  const limited = applyPeriodLimit(all, now);
-
-  // ---- 重复事件：最多浮"当前 + 预备"两颗（约束**未来**，不约束历史）----
-  //
-  // 用户原话："我觉得只浮当前与预备两颗（10.5 不浮），当然如果提前完成任务，
-  //            那么 10.5 该浮，逻辑是最多浮两颗"
-  //   · 未来的实例：只留最近的两颗（还没开始的）
-  //   · 过去的实例：**全部留下**（没戳破就是欠账，攒着才警醒）
-  //   · 提前完成当前那颗 → 它进回收站，预备那颗自动变成"当前"，
-  //     再下一颗补上"预备"位 —— 因为"未来取前两个"是滑动窗口，自动满足
-  const byEvent = new Map();
-  for (const it of limited) {
-    const list = byEvent.get(it.event.id) || [];
-    list.push(it);
-    byEvent.set(it.event.id, list);
-  }
-  const keepFutureIds = new Set();
-  for (const list of byEvent.values()) {
-    list.sort((a, b) => a.start - b.start);
-    const upcoming = list.filter((it) => it.start.getTime() > now.getTime());
-    for (const it of upcoming.slice(0, 2)) keepFutureIds.add(it.key);
-  }
-
-  const seen = new Set();
-  const out = [];
-  // 遍历 `limited`（已经过周期筛选）—— 下面所有"要不要浮"的判断都基于它
-  for (const item of limited) {
-    const key = item.event.id + '@' + toDateKey(item.start);
-    if (seen.has(key)) continue;
-
-    // 已经被戳破的这一颗 → 不再出现在气泡区（它进了回收气泡站）。
-    // 这是**按实例记账**的落点：重复事件只结束被戳的那一颗，其他颗照常新生。
-    // 非重复事件走老路（`done`），过滤器 `showDone || !ev.done` 已经挡掉了。
-    const poppedMap = item.event.popped;
-    if (poppedMap && typeof poppedMap === 'object' && poppedMap[occurrenceKeyOf(item.start)]) continue;
-
-    // 未来实例：只保留"当前 + 预备"两颗
-    const isUpcoming = item.start.getTime() > now.getTime();
-    if (isUpcoming && !keepFutureIds.has(item.key)) continue;
-
-    seen.add(key);
-    // 母气泡过期时，子气泡也跟着变紫（用户要求），所以要把"祖先里有没有过期的"传下去
-    const style = bubbleStyle(item, {
-      now,
-      forceOverdue: isOverdueEvent(item.event, state.events, now),
-      // 重复事件才显示"周几"（单次日程显示是噪音）
-      showWeekday: isRepeating(item.event),
-    });
-
-    // 「时间范围」不再是过滤器，而是**预览范围**：
-    // 超出范围（用户选 14 天，那就是 14 天以后）的实例**仍显示，但虚化**。
-    // 用户原话："将筛选改为预览模式，不应用，只用于筛选气泡时间（14 天后的任务虚化）"
-    // 它只对**未来**有意义（历史实例是"欠账"，虚化掉就看不见堆积了）。
-    const beyondPreview = isUpcoming && item.start.getTime() > to.getTime();
-    if (beyondPreview) style.dimmed = true;
-    out.push({ ...item, style, key });
-  }
-  // 越接近截止的越先画（画在下面），所以"马上到期"的会更靠视觉中心。
-  // 没设期限的排最后（不参与紧迫度排序）。
-  out.sort((a, b) => {
-    const ra = a.style.remaining == null ? Number.MAX_SAFE_INTEGER : a.style.remaining;
-    const rb = b.style.remaining == null ? Number.MAX_SAFE_INTEGER : b.style.remaining;
-    return rb - ra;
-  });
-  return out;
 }
 
 // ---------- 说明面板（含少量设置）----------
 // 面板默认隐藏（气泡区全屏展示），点 HUD 上的 ? 才出现。
 // 内容是"解释这个界面"：颜色、大小、操作、套娃规则。
-function renderPanel(host, legendHost, config, ctx, local) {
+function renderPanel(host, legendHost, config, ctx, local, state) {
   const seg = (options, current, onPick) => el('div.seg', {}, options.map((o) =>
     el('button', {
       type: 'button',
@@ -653,12 +706,13 @@ function renderPanel(host, legendHost, config, ctx, local) {
       infoLabel.textContent = sel.item.style.countdownText || '—';
     }
     renderLevels();
-    if (local.pickChip) {
-      local.pickChip.textContent = sel
-        ? `${sel.item.event.title} · ${sel.item.style.countdownText}`
-        : hudHint(state);
-      local.pickChip.classList.toggle('muted', !sel);
-    }
+    // 选中就显示"哪一颗 · 还剩多久"，取消选中就回到这一层的操作提示；
+    // 两者都是空的时候整格收起来（别留一个空胶囊）
+    setHudChip(
+      local.pickChip,
+      sel ? `${sel.item.event.title} · ${sel.item.style.countdownText}` : hudHint(state),
+      !sel,
+    );
   };
 
   mount(host, [
@@ -703,12 +757,51 @@ function renderPanel(host, legendHost, config, ctx, local) {
         { value: 14, label: '14 天' },
         { value: 30, label: '30 天' },
       ], config.horizonDays, (v) => { localStorage.setItem(HORIZON_KEY, String(v)); rerender(); }),
+      // 「自调」：用户要的不只是 3/7/14/30 这几档，还能自己填一个天数。
+      // ⚠️ 值要**夹到 1–365**：填 0 或者空会让气泡区只剩"今天"甚至什么都不剩，
+      //    而那种表现看起来像"气泡区坏了"，没人会想到是设置里填了个 0。
+      el('input.bubble-horizon-input', {
+        type: 'number',
+        min: '1',
+        max: '365',
+        step: '1',
+        value: String(config.horizonDays),
+        title: '自定义天数（1–365）',
+        'aria-label': '自定义时间范围天数',
+        onchange: (e) => {
+          const raw = Number(e.target.value);
+          const v = Math.max(1, Math.min(365, Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 14));
+          e.target.value = String(v);
+          localStorage.setItem(HORIZON_KEY, String(v));
+          rerender();
+        },
+      }),
+      el('span.bubble-tool-label', { text: '天（可自填）' }),
       el('div.spacer'),
       el('button.btn.btn-sm', {
         text: config.showDone ? '隐藏已完成' : '显示已完成',
         onclick: () => { localStorage.setItem(SHOW_DONE_KEY, config.showDone ? '0' : '1'); rerender(); },
       }),
       el('button.btn.btn-sm', { text: '重排', onclick: () => { resetRequested = true; rerender(); } }),
+    ]),
+    // 节日气泡：还剩几天时浮出来（用户定的默认 4 天、可调；0 = 不显示）
+    el('div.bubble-panel-row', {}, [
+      el('span.bubble-tool-label', { text: '节日气泡' }),
+      el('input.bubble-horizon-input', {
+        type: 'number', min: '0', max: '60', step: '1',
+        value: String(config.festivalDays),
+        'data-field': 'festival-days',
+        title: '节日还剩几天时浮出节日气泡（0 = 不显示）',
+        'aria-label': '节日气泡提前天数',
+        onchange: (e) => {
+          const raw = Number(e.target.value);
+          const v = Number.isFinite(raw) && raw >= 0 ? Math.min(60, Math.round(raw)) : 4;
+          e.target.value = String(v);
+          localStorage.setItem(FESTIVAL_DAYS_KEY, String(v));
+          rerender();
+        },
+      }),
+      el('span.bubble-tool-label', { text: '天前出现（0 = 不显示）' }),
     ]),
     // 课程开关（用户要求）：课程是周期性的，气泡区更适合放临时事务。
     // 用 `label.switch-row` 的现成样式（勾选框 + 文字一行，点哪都能切换）。
@@ -723,6 +816,11 @@ function renderPanel(host, legendHost, config, ctx, local) {
         },
       }),
     ]),
+
+    // —— 桌面气泡区（**只有 Windows 的 PC 版会显示这一整块**）——
+    // 用户要的"软件入口"就在这里：打开/关闭那一层、两个开关、开机自启。
+    // 平板上接口不存在（404）→ store 回答 null → 这一块整个不出现。
+    ...desktopLayerBlock(rerender),
 
     el('div.bubble-panel-row.bubble-size-row', {}, [
       el('span.bubble-tool-label', { text: '当前选中' }),
@@ -747,6 +845,37 @@ function renderPanel(host, legendHost, config, ctx, local) {
   renderLevels();
   renderLegend(legendHost);
 }
+
+/**
+ * HUD 上那一格（"点了哪个气泡 / 这一层怎么操作"）。
+ *
+ * ⚠️ **空文字时必须整格收起来**：`.bubble-hud-chip` 有边框和底色，
+ * 留着空文字就会画成一个**空的白色小胶囊**，看起来像"界面坏了"。
+ * 最外层没有容器时 `hudHint()` 返回的就是空串 —— 用户截图里左上角那个空盒子就是它。
+ * （配套的 CSS 里必须有 `.bubble-hud-chip[hidden] { display: none }`，
+ *   否则 `display: inline-flex` 会盖过 `[hidden]`。）
+ */
+function setHudChip(chip, text, muted) {
+  if (!chip) return;
+  const t = text || '';
+  chip.textContent = t;
+  chip.hidden = !t;
+  chip.classList.toggle('muted', muted == null ? !t : !!muted);
+}
+
+/**
+ * ⚠️ 这个文件里已经栽过三次"自由变量"（`state` / `tapRipple` / `state.events`），
+ * 三次的表现都是**静默半坏**：异常要么被浏览器吞掉，要么发生在 setTimeout 回调里，
+ * 用户只看到"点了没反应"。所以留一条自查的说明：
+ *
+ *   在**任何**函数体里引用 `state` / `ctx` / `config` / `local` 之前，
+ *   先确认它们出现在**本函数的形参或本作用域的 const** 里。
+ *   尤其是「渲染期建立、手势期才调用」的闭包（`setSelected`、`isOverdueContainer`）——
+ *   它们抛错的时间点离定义点很远，看代码看不出来。
+ *
+ * 现在由真浏览器测试兜着（`tools/bubble-touch.test.mjs` 会真的在容器里点背景），
+ * 但别因此就敢随便加闭包。
+ */
 
 /** 说明面板里的一行：左边做法，右边解释；可选一个色块 */
 function helpLine(action, desc, color) {
@@ -853,6 +982,68 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
 
   /** 顶部要给 HUD 留出的高度：气泡不许进这一条，否则会盖住 ⚙ / 计数条 */
   function hudInset() { return 46; }
+
+  // -------------------------------------------------------------------------
+  // 定时重算「还剩多久」
+  //
+  // ⚠️ 为什么必须有这一段（用户实测报的 bug，原话："时间不动，删进程重进才会变"）：
+  //    `bubbleStyle()` 在渲染时**只算一次**；之后帧循环只做物理
+  //    （半径向 targetR 逼近、漂浮、碰撞），**完全不重算时间**。
+  //    app.js 里也没有任何周期性 refresh —— 于是"剩余 X"和气泡大小**冻住**，
+  //    只有数据变化 / 切视图 / 手动操作才会更新，用户得杀进程重进。
+  //    而"大小 = 还剩多久"是气泡区的核心表达，不刷新等于废掉一半。
+  //
+  // 为什么**不用** `ctx.refresh()`：那会把整棵视图重建、气泡**重新散开**，
+  //    位置每隔几秒全跳一次，很难受。这里只重算 style + 目标半径，
+  //    位置和速度都不动；半径由 step() 平滑逼近 → 气泡"慢慢长大"，
+  //    正是 countdown.js 那套曲线的设计意图。
+  //
+  // 15 秒够用：倒计时本身是分钟粒度，而重算只是几十次纯函数调用，成本可忽略。
+  // -------------------------------------------------------------------------
+  // 1 秒重算一次。为什么可以这么勤：
+  //   `bubbleStyle()` 是纯函数（日期算术 + 查表），气泡上限 90 颗，
+  //   即每秒九十次纯计算 —— 成本可忽略。好处是倒计时在分钟边界后 1 秒内就跳，
+  //   气泡生长也足够平滑。
+  //
+  // ⚠️ 但要写清楚一件容易误会的事（用户就问过）：
+  //   **提醒的触发完全不走这里。** 网页端由 `web/adapter/reminder.js` 自己的
+  //   `setInterval` 驱动；iOS 壳里更是**提前注册成系统的定时通知**
+  //   （UNCalendarNotificationTrigger），App 关掉都会响。
+  //   所以这个间隔只影响"画面上的字和大小多久更新一次"，
+  //   **调大调小都不会让提醒早响或晚响**。
+  const RESTYLE_MS = 1000;
+  // 用 performance.now() 起算而不是 0：帧循环里的 now 也是 performance.now()，
+  // 若从 0 起算，页面活过 15 秒后**第一次渲染完的下一个帧就会立刻重算一次**
+  // （无害，但没必要）。这样第一次重算是"渲染后 15 秒"。
+  let lastRestyle = performance.now();
+  // 只警告一次，别每 15 秒刷一条
+  let restyleFailed = false;
+
+  function restyleAll() {
+    const now = new Date();
+    for (const b of bodies) {
+      const item = b.item;
+      if (!item || !item.event) continue;
+      // ⚠️ 这里是 `events`（startSimulation 的解构参数），**不是 `state.events`**。
+      //    写成 state.events 会 ReferenceError，而且异常会**打断 rAF 循环** ——
+      //    表现是"气泡不动了 + 倒计时也不走"，比原来的 bug 更糟。
+      //    （实测踩到：tools/bubble-clock.test.mjs 精确报出了这行。）
+      const style = bubbleStyle(item, {
+        now,
+        // 同上：只看**祖先链**，不要拿自己的 base 期限当"容器过期"（那圈紫齿轮的根因）
+        forceOverdue: stateOps.inheritedOverdueOf(item.event, events, now),
+        // 重复事件才显示"周几"（单次日程显示是噪音）
+        showWeekday: isRepeating(item.event),
+      });
+      // 「时间范围」预览造成的淡化是按渲染时算的，和 now 无关 —— 要保留，
+      // 否则重算一次就把虚线预览的淡化弄没了。
+      if (item.style && item.style.dimmed) style.dimmed = true;
+      item.style = style;
+      // 过期状态可能刚刚发生变化：过期气泡要**定点不动**
+      b.frozen = !!style.overdue;
+    }
+    applySizes();
+  }
 
   function clampAll() {
     for (const b of bodies) {
@@ -1359,6 +1550,27 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
       time += dt;
       step(dt);
     }
+    // 每 RESTYLE_MS 重算一次「还剩多久」——
+    // 否则倒计时文字和气泡大小会冻住，必须杀进程重进才更新（见 restyleAll 的说明）。
+    // 放在 step 之后、draw 之前：这样这一帧画出来的就是刚算好的新值。
+    //
+    // ⚠️ 必须 try/catch。重算里一旦抛异常，异常会**从这里冒出去**，
+    //    于是函数末尾那句 `raf = requestAnimationFrame(frame)` 不再执行 ——
+    //    **整个动画循环就死了**（气泡不漂了、倒计时也不走了）。
+    //    我实测踩过：restyleAll 里写错一个变量名，表现是"动都不动了"，
+    //    比原来的"时间不动"更难查。宁可真算不出来（退化成旧行为），
+    //    也不能把新加的一个功能变成整块界面停摆。
+    if (now - lastRestyle > RESTYLE_MS) {
+      lastRestyle = now;
+      try {
+        restyleAll();
+      } catch (err) {
+        if (!restyleFailed) {
+          restyleFailed = true;
+          console.warn('[bubble] 重算剩余时间失败（倒计时会停，但界面仍然可用）：', err);
+        }
+      }
+    }
     draw();
     if (debugHost) updateDebug();
     raf = requestAnimationFrame(frame);
@@ -1390,8 +1602,21 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
     window.__bubbleBodies = () => bodies.map((b) => ({
       key: b.key, x: b.x, y: b.y, r: b.r,
       title: (b.item && b.item.event && b.item.event.title) || '',
+      // 这两个字段是给「倒计时会不会自己走」那条测试用的。
+      // 没有它就只能看 canvas 像素，而"文字变了没有"是测不出来的。
+      remaining: (b.item && b.item.style) ? b.item.style.remaining : null,
+      countdown: (b.item && b.item.style) ? b.item.style.countdownText : null,
+      frozen: !!b.frozen,
+      // 过期三兄弟也暴露出来：**画在 canvas 上的东西没法用 DOM 断言**
+      // （"这一颗到底是不是被判成过期/继承过期"只能从这里读）。
+      // 截图里那圈"紫齿轮"就是 overdueInherited 画出来的，测试必须能直接问它。
+      overdue: !!(b.item && b.item.style && b.item.style.overdue),
+      ownOverdue: !!(b.item && b.item.style && b.item.style.ownOverdue),
+      overdueInherited: !!(b.item && b.item.style && b.item.style.overdueInherited),
     }));
     window.__bubbleCanvasSize = () => ({ width, height });
+    // 手动触发一次重算（测试用；生产代码里由帧循环每 RESTYLE_MS 调一次）
+    window.__bubbleRestyle = () => { restyleAll(); return true; };
   }
   // 拖拽诊断的暂存区（只有 debug 打开时才写入）
   const debugState = debugOn ? {} : null;
@@ -1459,6 +1684,19 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
 
+  /** 背景被按下 → 立刻给一圈涟漪（见 tapRipple 的说明）。
+   *  重播动画的写法不能省：只 remove/add class 有时不会重新触发（浏览器会合并样式变更），
+   *  中间读一次 offsetWidth 强制重排才稳。 */
+  function showTapRipple(x, y) {
+    const tapRipple = local.tapRipple;
+    if (!tapRipple) return;
+    tapRipple.style.left = `${x}px`;
+    tapRipple.style.top = `${y}px`;
+    tapRipple.classList.remove('on');
+    void tapRipple.offsetWidth;
+    tapRipple.classList.add('on');
+  }
+
   function onDown(e) {
     const p = localPos(e);
     const b = pick(p.x, p.y);
@@ -1471,6 +1709,7 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
       //   · 在最外层 → 只是取消选中
       bgTapAt = performance.now();
       bgTapPos = p;
+      showTapRipple(p.x, p.y);
       if (local.setSelected) local.setSelected(null);
       return;
     }
@@ -1656,11 +1895,24 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
     if (holdBody) { holdBody.hold = 0; holdBody = null; }
 
     // ---- 点在背景上：单击 = 加子气泡，双击 = 出去 ----
+    //
+    // ⚠️⚠️ 这里原来写的是 `moved < 8 && performance.now() - bgTapAt < 400`
+    //     —— **按住的时长不超过 400 毫秒**才算"轻点"。这就是 iPad 上
+    //     "单击母气泡背景想加子泡泡，一点反应都没有"的根因：
+    //       · 鼠标点一下是瞬时事件（几十毫秒），永远过关
+    //       · **手指按在玻璃上的时长普遍在 100–300ms，犹豫一下/等反馈就超过 400ms**
+    //       · 超过就 `return` —— 不报错、不提示、什么都不发生，用户只能看到"无响应"
+    //     而且前半句其实**恒等于 0**：背景这一支不会设 dragBody，`onMove` 直接 return，
+    //     `lastPos` 永远等于按下时的 `bgTapPos` —— 所以这就是一个纯粹的时长闸门。
+    //
+    //     修法（有依据，不是调参数）：**背景上没有"长按"这个手势**（长按戳破只对气泡有效），
+    //     所以时长不携带任何信息，只有"移动了多远"才有意义 —— 拖动才是另一种意图。
+    //     于是判据改成只看位移（12px 容手指抖动），时长不再参与。
     if (!dragBody && bgTapAt) {
       const moved = Math.hypot(lastPos.x - bgTapPos.x, lastPos.y - bgTapPos.y);
-      const quick = moved < 8 && performance.now() - bgTapAt < 400;
+      const isTap = moved < 12;
       bgTapAt = 0;
-      if (!quick) return;
+      if (!isTap) return;
       handleBackgroundTap();
       return;
     }
@@ -1670,7 +1922,10 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
     b.dragging = false;
     dragBody = null;
     local.setDropMode?.(false);
-    const quick = pointerMoved < 8 && performance.now() - pointerDownAt < 400;
+    // ⚠️ 气泡这一支同理：400ms 对**手指**太短了。长按戳破是 2.5 秒（LONG_PRESS_MS），
+    //    而且真戳破之后 dragBody 已被清空、根本走不到这里，所以这里的时间闸门
+    //    只要卡在"不是长按"就够 —— 取长按时长的一半，给手指留足余量。
+    const quick = pointerMoved < 8 && performance.now() - pointerDownAt < LONG_PRESS_MS * 0.5;
 
     // 拖过又松手（不是轻点）→ 判定"放进哪个气泡 / 是否拉出母气泡"。
     // 只在松手时判定，所以气泡日常互相碰撞不会误触发嵌套。
@@ -1728,8 +1983,15 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
       if (containerId) {
         // ⚠️ 紫色（过期）容器**只读**：能进去看，但不能往里加子泡泡。
         //    过期意味着这件事翻篇了，还往上挂新东西没有意义（用户明确要求）。
+        //
+        // ⚠️⚠️ 这里原来写的是 `ctx.toast?.({...})` —— 而 app.js 的 `ctx` 上
+        //    **根本没有 `toast` 这个属性**，`?.` 于是**静默跳过**：
+        //    结果"过期容器不加泡泡"这条规矩**挡住了操作、却一句话都不说**，
+        //    用户看到的就是"点了没反应"。这跟 `state` 那个 bug 是同一类：
+        //    **`?.` 用在"其实不存在"的东西上 = 把错误藏起来**。
+        //    直接用本文件顶部 import 进来的 `toast()`（文件里其它地方都这么用）。
         if (local.isOverdueContainer?.()) {
-          ctx.toast?.({
+          toast({
             title: '紫泡泡不能再加泡泡了哦·-·',
             body: '过期了，只能看看',
             timeout: 2000,
@@ -1889,20 +2151,8 @@ function addSquash(b, sign, nx, ny, amount) {
   b.squashVel = Math.max(b.squashVel, capped * 3);
 }
 
-// 线性混合两色（玻璃感需要"往白里混"而不是单纯调透明度）
-function mixColor(a, b, t) {
-  const pa = rgbOf(a); const pb = rgbOf(b);
-  const k = Math.max(0, Math.min(1, t));
-  const out = [0, 1, 2].map((i) => Math.round(pa[i] + (pb[i] - pa[i]) * k));
-  return `#${out.map((c) => c.toString(16).padStart(2, '0')).join('')}`;
-}
-
-function rgbOf(hex) {
-  let h = String(hex).replace('#', '');
-  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
-  const n = parseInt(h, 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-
+// 线性混合两色、以及 rgbOf —— 都搬到 core/palette.js 了（桌面泡泡要画同一个"泡体"，
+// 两边混色的配方必须一样：往白里混 42% 当受光面、往深里混 45% 当背光面）。
+//
 // 让 tierByKey 的导出被使用（lint 友好 + 供未来扩展）
 export { tierByKey };
