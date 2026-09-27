@@ -122,7 +122,16 @@ export function bubbleStyle(item, opts = {}) {
   const overdue = ownOverdue || !!opts.forceOverdue;
 
   // 大小通道：只由"还剩多久"决定（连续曲线，档内加速）
-  const band = bandForRemaining(remaining == null ? Infinity : remaining);
+  //
+  // ⚠️ 这里以前写的是 `bandForRemaining(remaining == null ? Infinity : remaining)`，
+  //    想的是"喂个 ∞ 就能拿到最不紧迫的档"。**恰好相反**：`bandForRemaining()` 对
+  //    **非有限数**走的是"兜底到最紧迫的秒档"那一支 —— 于是"没设期限"的档位是 'second'，
+  //    而这个函数里另外三支全是中性：大小用 `NEUTRAL_SIZE`(0.30)、强度硬写 1（不催）、
+  //    文字是"未设期限"。四支口径里只有档位在喊"马上到期"，用户看到的就是这个矛盾。
+  //    现在 `remaining == null` 直接交给 `bandForRemaining()`，它返回明确的
+  //    `UNSET_BAND`（'unset' / '未设期限'），四支一致。
+  //    有期限的七档阈值、含义**一个字都没动**（由 tools/bubble-band-unset.test.mjs 钉住）。
+  const band = bandForRemaining(remaining);
   // 尺寸只在**自己**过期时才拉满；"因为母气泡过期才变紫"的子气泡**保持自己的尺寸**。
   //   ⚠️ 一开始让继承的也拉满，结果一个容器里几个子气泡全变成最大，
   //      在那个空间里根本挤不开（实测 overlap=2 maxOv=123，文字叠在一起看不清）。
@@ -139,15 +148,41 @@ export function bubbleStyle(item, opts = {}) {
 
   // 颜色通道：事情多大
   const levelKey = levelOf(ev);
-  const level = levelByKey(levelKey);
+  /**
+   * ⚠️⚠️ 这里必须保证 `level` 是一个**带数字 `rank` 的对象**，否则整块气泡区会空白。
+   *
+   * 因果链（2026-09-27 在真绘制循环里实测复现过）：
+   *   `level` 不是对象（是字符串 'red' / `{}` / 旧数据）
+   *     → 渲染器的 `1.16 + (st.level ? st.level.rank : 0) / 40` 得到 `undefined/40 = NaN`
+   *     → `createRadialGradient(b.x, b.y, r*0.7, b.x, b.y, r*NaN)`
+   *     → **WebKit 抛 `The provided double value is non-finite`**
+   *     → 绘制循环整帧中断 → **所有泡泡"隐身"，但命中判定照旧**（用户报的原话）。
+   *
+   * `levelByKey()` 正常就返回对象（见 core/level.js 的 BY_KEY），这里再兜一道是**故意的**：
+   * 这个项目"缺一个字段就炸整块画布"已经栽过两次（第 48 轮节日泡泡漏 radius 那次），
+   * 而"以后数据一定干净"是个不可信的假设。
+   *
+   * 注意 `DEFAULT_LEVEL` 是**字符串** 'sky'（不是对象）—— 别拿它当对象用。
+   */
+  const levelRaw = levelByKey(levelKey);
+  const level = (levelRaw && Number.isFinite(Number(levelRaw.rank)))
+    ? levelRaw
+    : levelByKey(DEFAULT_LEVEL);
 
   // 通知强度：看还剩多久（不看颜色）
+  // ⚠️ `remaining == null` 这一支必须**排在前面**判：没期限 → 1（不催）。
+  //    不要指望 `band.key === 'unset'` 走到 `intensityForBand()` —— 虽然那里也给了 1
+  //    （见 core/level.js 的 BAND_INTENSITY.unset），但这条捷径别断：
+  //    "没期限"和"马上到期"是两件事，强度必须各自明确。
   const intensity = remaining == null ? 1 : (ownOverdue ? 4 : intensityForBand(band.key));
 
   return {
     // 兼容旧字段
     urgency: { score: urgencyOf(ev.start, now).score, hours: (remaining == null ? NaN : remaining / 3_600_000) },
-    magnitude: level.rank * 33 + 1,           // 旧字段：给老组件一个近似值
+    // 旧字段：给老组件一个近似值。
+    // ⚠️ 这里以前写的是 `level.rank * 33 + 1` —— 只要 `level` 不是对象就得到 **NaN**
+    //    （同一个雷；现在 level 上面已经兜住了，这里再夹一道，保证输出永远是有限数）。
+    magnitude: (Number.isFinite(Number(level.rank)) ? Number(level.rank) : 0) * 33 + 1,
     tier: level,                              // 颜色档位（现在是"事情多大"）
     tierKey: levelKey,
     level,
@@ -166,6 +201,10 @@ export function bubbleStyle(item, opts = {}) {
      * "容器过期了"这件事交给 `overdueInherited` 标记，由渲染层用**另一种视觉**表达
      * （现在画成一圈暗紫虚线环，而不是整颗变紫）。
      */
+    // ⚠️ `band.key` 现在可能是 'unset'（没设期限的中性档，见 core/countdown.js 的 UNSET_BAND）。
+    //    读这两个字段的地方必须能接住它 —— **不许**写成 `TIME_BANDS` 里那七档的查表
+    //    （那样 'unset' 会查空，回落到"秒"或 undefined）。当前消费者清单见
+    //    tools/bubble-band-unset.test.mjs 的文件头。
     band: ownOverdue ? 'second' : band.key,
     bandLabel: ownOverdue ? '已过期' : band.label,
     overdue,
@@ -214,7 +253,23 @@ function detailTextFor(remaining, now, fuzzy) {
 // 通知强度（前端也用它显示图例/预览）
 // ---------------------------------------------------------------------------
 
-/** 事件类型 → 默认"事情多大"（四档颜色） */
+/**
+ * 事件类型 → 默认"事情多大"（四档颜色）的**键**。
+ *
+ * ⚠️⚠️ 注意这里给的是**键字符串**（'red'），不是 `core/level.js` 里的等级**对象**。
+ *    同一个模块里 `levelOf()` 返回的也是键，而 `levelByKey(key)` 返回的才是对象。
+ *    两种形态混用就是"`style.level.rank` 读到 undefined"那个雷的来源
+ *    （`undefined / 40 = NaN` → `createRadialGradient` 抛非有限 → 整块气泡区空白，
+ *     2026-09-27 在真绘制循环里实测复现过）。
+ *
+ *    所以用它的地方**必须**再过一遍 `levelByKey()`：
+ *      ✅ `levelByKey(defaultLevelForType(type))` → 对象
+ *      ❌ 直接把这个返回值塞进 `style.level` → 渲染器读到字符串，成批出事
+ *    （`core/bubble-draw-numbers.js` 的 `safeLevelOf()` 是这条规矩的兜底执行者。）
+ *
+ * ⚠️ 目前只有测试直接调它（`tools/bubble.test.mjs`），产品代码里没有调用点 ——
+ *    但它是个导出的公开 API，谁哪天拿去用就会踩上面那个雷，所以这里把契约写死。
+ */
 export const TYPE_DEFAULT_LEVEL = {
   exam: 'red',        // 考试：重大
   task: 'amber',      // 任务：大事
@@ -224,8 +279,20 @@ export const TYPE_DEFAULT_LEVEL = {
   other: 'sky',
 };
 
+/** 事件类型 → 默认等级**键**（不是对象！见 TYPE_DEFAULT_LEVEL 的说明） */
 export function defaultLevelForType(type) {
   return TYPE_DEFAULT_LEVEL[type] || DEFAULT_LEVEL;
+}
+
+/**
+ * 事件类型 → 默认等级**对象**（`{ key, rank, label, color, colorName }`）。
+ *
+ * ⚠️ 这个函数的存在就是为了**掐掉"键/对象混用"**：需要对象的调用方（例如要给
+ *    `style.level` 赋值的地方）用这个，而不是 `levelByKey(defaultLevelForType(t))`
+ *    这种"记得再过一道"的写法 —— 靠记性守的规矩迟早会忘。
+ */
+export function defaultLevelObjectForType(type) {
+  return levelByKey(defaultLevelForType(type));
 }
 
 /** @deprecated 用 defaultLevelForType：事情多大现在是四档颜色，不是 1–100 的连续值 */

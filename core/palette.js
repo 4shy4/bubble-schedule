@@ -143,6 +143,22 @@ export function hexToRgba(hex, alpha = 1) {
   return `rgba(${(num >> 16) & 255}, ${(num >> 8) & 255}, ${num & 255}, ${alpha})`;
 }
 
+/**
+ * 这个颜色字符串能不能安全地交给 canvas？
+ *
+ * ⚠️ 它挡的是**另一半**：`rgba(255, 0, 0, NaN)` 不会报 "non-finite"，
+ *    而是报 "The color ... is not a valid color"（WebKit 原话），
+ *    两者都会**打断整帧**、表现都是"泡泡隐身"。所以透明度是 NaN 时也要能一眼看出来。
+ *
+ * 用途：测试里当尺子（`tools/bubble-finite.test.mjs` 的假 canvas 会拿它判每一次
+ * `addColorStop`），以及现场诊断时判断"这次到底是数字坏了还是颜色坏了"。
+ */
+export function safeRgba(v) {
+  if (typeof v !== 'string' || !v) return false;
+  if (/NaN|Infinity|undefined/.test(v)) return false;
+  return /^#[0-9a-fA-F]{3,8}$/.test(v) || /^rgba?\(/.test(v);
+}
+
 export function luminance(hex) {
   const h = String(hex).replace('#', '');
   const full = h.length === 3 ? h.split('').map((c) => c + c).join('') : h;

@@ -70,14 +70,56 @@ export const NEUTRAL_SIZE = 0.30;
 /** 已过截止时的尺寸：仍取最大尺寸（过期不缩水，而是变紫长刺） */
 export const OVERDUE_SIZE = 1.45;
 
+/**
+ * 「未设期限」的**中性档位**（没填截止时间的那一档）。
+ *
+ * 为什么需要一个明确的档位（用户报的矛盾）：
+ *   没填期限的泡泡，`style.band` 以前落在**最紧迫**的"秒"档，可是**同一颗泡泡**上
+ *   大小走 `NEUTRAL_SIZE`(0.30)、通知强度是 1（不催）、倒计时文字写着"未设期限" ——
+ *   四支口径里只有档位在喊"马上到期"。给它一个明确的中性档，四支才说得通。
+ *
+ * ⚠️ 它**故意不在 `TIME_BANDS` 里**，三条理由（别顺手挪进去）：
+ *   ① `TIME_BANDS` 是"还剩多久 → 气泡多大"的**有序刻度**：七档、`lo`/`hi` 端点相接、
+ *      `bandIndex()` 靠数组下标定位。未设期限根本没有"还剩多久"，塞进去会平白多出一档，
+ *      把 `bandOverview()` 的七行表和 `bandIndex()` 的刻度一起挪位。
+ *   ② 尺寸那条通道早就单独走 `NEUTRAL_SIZE` 了（`sizeRatioForRemaining(null)`），
+ *      不需要新档位参与 —— 所以本对象**故意没有 `lo`/`hi`/`p`/`min`/`max`**。
+ *      谁把它当尺寸档读会读到 `undefined`，别这么用（要尺寸就用 `NEUTRAL_SIZE`）。
+ *   ③ `bandForRemaining()` 是在 `TIME_BANDS` 里按 `min` 逐档比大小的；
+ *      多一条 `min: 0` 的记录会把**所有**剩余时间都吞进新档。
+ *
+ * `label` 必须和 `formatRemaining(null)` / `countdownTextOf(null)` 一字不差（都是"未设期限"）：
+ * 同一件事在界面上出现两种说法，就是下一个 bug。
+ */
+export const UNSET_BAND = Object.freeze({ key: 'unset', label: '未设期限' });
+
 const BAND_BY_KEY = new Map(TIME_BANDS.map((b) => [b.key, b]));
 
+/**
+ * 档位键 → 七档尺寸表里的那条记录。**不含「未设期限」**（见 `UNSET_BAND` 的说明）。
+ *
+ * ⚠️ `bandByKey('unset')` 故意返回 `null`，不要"顺手补上"：
+ *    `UNSET_BAND` 上没有 `lo`/`hi`/`p`，把它当尺寸档返回，调用方读到 `undefined`
+ *    再去算尺寸就是 **NaN**（这个项目栽过好几次的正是这一类）。
+ *    `null` 是一个**明确的**"不在尺寸刻度上"，调用方必须自己处理；
+ *    要"未设期限"这个名字请直接用 `UNSET_BAND`。
+ */
 export function bandByKey(key) {
   return BAND_BY_KEY.get(key) || null;
 }
 
-/** 档位序号：**0 = 最紧迫（秒），6 = 最不紧迫（年）** */
+/**
+ * 档位序号：**0 = 最紧迫（秒），6 = 最不紧迫（年）**。
+ *
+ * 「未设期限」不在紧迫度刻度上：它没有截止时刻，所以排到**最不紧迫**那一端（6），
+ * 和 `core/bubble-select.js` 把 `remaining == null` 的泡泡排到最后是同一个口径。
+ *
+ * ⚠️ 少了这一支，`findIndex` 会返回 -1 → 落到下面的兜底 `0` = "最紧迫的秒档"，
+ *    正好就是这次要修掉的"没设期限 = 最紧急"那个毛病（兜底值往最紧迫那边倒，
+ *    是这套代码里最容易复发的一类 bug）。
+ */
 export function bandIndex(key) {
+  if (key === UNSET_BAND.key) return TIME_BANDS.length - 1;
   const i = TIME_BANDS.findIndex((b) => b.key === key);
   return i < 0 ? 0 : TIME_BANDS.length - 1 - i;
 }
@@ -92,8 +134,20 @@ export function bandIndex(key) {
 /**
  * 剩余时间 → 档位。表是按"最不紧迫 → 最紧迫"排的，逐档判断 `min` 即可。
  * 边界含下界不含上界，所以 365 天 = 年档、30 天 = 月档、7 天 = 周档、24 小时 = 日档。
+ *
+ * `null` / `undefined`（= 没设期限）→ `UNSET_BAND`（中性），**不是**秒档。
  */
 export function bandForRemaining(remainingMs) {
+  // 「没设期限」是一个**明确的中性档**，不是"最紧迫"。
+  //
+  // ⚠️ 必须在 `Number()` **之前**判 null：
+  //    `Number(null) === 0`，会和"正好到期"（真正的 0）分不开；而 0 是"已过期"那一支，
+  //    于是没填期限的会被算成"马上就到期"（用户报的矛盾）。
+  //    `undefined` 同理（`Number(undefined) === NaN`）。
+  //
+  // 注意这里**只改 null/undefined**：NaN / ±Infinity 仍然走下面的兜底秒档、
+  // 0 与负数（已过期）也仍然是秒档 —— 有期限的七档阈值和含义一个字都没动。
+  if (remainingMs == null) return UNSET_BAND;
   const ms = Number(remainingMs);
   if (!Number.isFinite(ms) || ms <= 0) return BAND_BY_KEY.get('second');
   for (const band of TIME_BANDS) {

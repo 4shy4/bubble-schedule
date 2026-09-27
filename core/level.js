@@ -8,7 +8,7 @@
 // 黄色里只能有绿/蓝；绿色里只能有蓝；蓝色双击只抖一下，进不去。
 // 也就是**元素框的等级必须严于父容器**：红(3) > 黄(2) > 绿(1) > 蓝(0)。
 
-import { TIME_BANDS, bandForRemaining } from './countdown.js';
+import { TIME_BANDS, bandForRemaining, UNSET_BAND } from './countdown.js';
 
 /** 四档颜色与等级，rank 越大 = 事情越大 = 颜色越"重" */
 export const LEVELS = [
@@ -88,6 +88,20 @@ export const BAND_INTENSITY = {
   hour: 3,
   minute: 4,
   second: 4,
+  /**
+   * 「未设期限」（`core/countdown.js` 的 `UNSET_BAND`）→ **1 = 不催**。
+   *
+   * 为什么是 1，而不是"和秒档一样 4"：
+   *   强度表表达的是"越接近截止越该打扰"，而"没期限"根本没有截止时刻，
+   *   这条规则对它无从谈起 —— 它只能是中性的那一个值。
+   *
+   * 为什么要有**显式**一条、而不是靠下面 `|| 1` 的兜底：三处口径必须写在一起看得见，
+   * 免得哪天有人把兜底改成"往最高档倒"（那种故障用户只会觉得"App 乱响"）：
+   *   · 这里 → 1
+   *   · `core/urgency.js` 的 `bubbleStyle()`：`remaining == null` → 强度硬写 1
+   *   · `core/state-ops.js` 的 `bandForEvent()`：没期限 → `intensity: 1`
+   */
+  unset: 1,
 };
 
 /** 剩余时间档位 → 提醒提前量（分钟）。负值 = 截止之后追问。 */
@@ -101,11 +115,22 @@ export const BAND_REMINDER_PLAN = {
   second: [10, 0, -5, -15, -25],
 };
 
+/**
+ * 档位键 → 通知强度 1–4。
+ *
+ * ⚠️ 认不出来的键（脏数据给的野档位名）一律兜底成 **1（不催）**。
+ *    强度是"打扰用户"的许可：宁可少响一次，也别因为一个不认识的键把提醒拉到必看+闹铃那一档。
+ *    （"未设期限"在表里有自己的一条 1，不走这个兜底。）
+ */
 export function intensityForBand(bandKey) {
   return BAND_INTENSITY[bandKey] || 1;
 }
 
 export function reminderPlanForBand(bandKey) {
+  // ⚠️ 「未设期限」不在这张表里 → 落到 year 档那份最不打扰的 [10, 0]。
+  //    真实提醒不走这里：core/state-ops.js 的 effectiveReminders() 对"没期限"**直接返回 [0]**
+  //    （只准点提醒一次）。这条兜底只是保证任何查表的调用方都有一个明确的、不催的答案，
+  //    而不是 undefined（undefined 展开就抛）。
   const plan = BAND_REMINDER_PLAN[bandKey] || BAND_REMINDER_PLAN.year;
   return [...new Set(plan)].sort((a, b) => b - a);
 }
@@ -115,6 +140,24 @@ export function reminderPlanForBand(bandKey) {
  * @returns {{band:string, intensity:number, plan:number[], overdue:boolean}}
  */
 export function notificationPlanForRemaining(remainingMs) {
+  /**
+   * ⚠️ 「没设期限」（null / undefined）→ **中性**：不催，只准点提醒一次。
+   *
+   * 这一支是必须的，别删。以前 null 会掉进下面的 `!(null > 0)` → 被当成**已过期**：
+   * 强度 4 + "截止后追问"的计划。而**真正会响**的那份计划来自
+   * `core/state-ops.js` 的 `effectiveReminders()` —— 它对没期限的事件返回 `[0]`。
+   * 两者矛盾，表现就是编辑器里那句「**马上到期** · 强度 4」紧挨着"没有截止时间"
+   * （同一屏自相矛盾）。现在两处口径一致：档位 'unset'、强度 1、计划 `[0]`、不算过期。
+   *
+   * 这么改**不会动到真正的通知行为**（已逐条核过调用方）：
+   *   · `core/notify-plan.js` 排未来提醒时喂进来的是 `anchor - fireAt`（有限数），永远不是 null
+   *   · `core/state-ops.js` 的 `effectiveReminders()` / `bandForEvent()` 在到达这里之前就把 null 挡住了
+   *   · `web/adapter/reminder.js`、`web/adapter/native.js` 传的也是有限数
+   *   唯一真的会传 null 的是编辑器的提醒预览（只显示，不排提醒），它现在说的才是真话。
+   */
+  if (remainingMs == null) {
+    return { band: UNSET_BAND.key, intensity: 1, plan: [0], overdue: false };
+  }
   const overdue = !(remainingMs > 0);
   const band = bandForRemaining(remainingMs).key;
   return {
@@ -170,7 +213,14 @@ export function notifyStyleForIntensity(level) {
   return { ...NOTIFY_INTENSITY[i], intensity: i };
 }
 
-/** 给界面/自检用的一张总表：档位 → 尺寸区间 + 通知强度（按"最不紧迫 → 最紧迫"排列） */
+/**
+ * 给界面/自检用的一张总表：档位 → 尺寸区间 + 通知强度（按"最不紧迫 → 最紧迫"排列）。
+ *
+ * ⚠️ 只有**七档**（`TIME_BANDS`）。「未设期限」故意不进来：
+ *    它没有尺寸区间（走 `NEUTRAL_SIZE`）、也不在紧迫度刻度上，混进来会让
+ *    "七档"这张表变成八行，读表的人分不清哪一档是真的时间刻度。
+ *    它自己的中性值在 `BAND_INTENSITY.unset`（1）和 `UNSET_BAND`（'unset'/'未设期限'）里。
+ */
 export function bandOverview() {
   return TIME_BANDS.map((b) => ({
     band: b.key,

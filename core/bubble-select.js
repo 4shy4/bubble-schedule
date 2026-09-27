@@ -19,6 +19,8 @@ import { isNotYetVisible, inheritedOverdueOf, occurrenceKey } from './state-ops.
 import { asDate } from './time.js';
 // 节日气泡（算出来的虚拟事件；专用颜色也在那儿）
 import { festivalEvents, FESTIVAL_COLORS } from './holidays.js';
+// 等级「键 → 对象」的唯一入口（节日泡泡要把 style.level 也一起覆盖，见下面的说明）
+import { levelByKey } from './level.js';
 
 /** 往前看多久（历史实例是"欠账"，要留着当紫泡泡堆着）。上限免得日级事件展开出上千个 */
 export const LOOKBACK_DAYS = 180;
@@ -175,37 +177,67 @@ export function selectBubbleItems(events = [], {
   //   · 是**算出来的虚拟事件**，不进库、只读（id 前缀 `festival:`）
   if (festivalDays > 0 && !anyParent && parentId == null) {
     for (const f of festivalEvents(now, { days: festivalDays })) {
+      const start = new Date(f.start);
+      const end = new Date(f.end);
+      // ⚠️⚠️ 这里**必须**用 `bubbleStyle()` 算，绝对不许手写 style 对象。
+      //
+      // 手写过一次的代价（第 48 轮，用户填 40 天才浮出节日泡泡时引爆）：
+      //   手写的 style 里漏了 `radius` → 渲染器第一句 `const r = item.style.radius` 拿到 undefined
+      //   → `mass = Math.max(1, (r*r)/900)` 变成 **NaN** → 物理位置全变 NaN
+      //   → `createRadialGradient: The provided double value is non-finite` 抛异常
+      //   → **整个气泡区一片空白**（不是"少一颗泡泡"，是所有泡泡一起消失）。
+      //   用户看到的只有"APP 出了个错"，和"少个字段"之间没有任何表面联系。
+      // 凡是"由事件算出来的显示样式"，一律共用这一个函数 —— 这样永远不可能再漏。
+      const style = bubbleStyle({ event: f, start, end, deadline: start, key: f.id }, { now });
+
+      // 颜色走 `tier.color`（渲染层真正用来画泡体的就是它），但**档位 key 仍写 'red'**：
+      // 这样文字排版/白字/统计都还按已有的"重大"那档走，不必让 palette、列表、
+      // 统计到处都去认一个第五档。（"专用颜色"要的是**看得出来的区别**，不是新档位。）
+      style.tier = {
+        key: 'festival', rank: 3, label: '节日',
+        color: FESTIVAL_COLORS.fill, colorDeep: FESTIVAL_COLORS.fillDark, colorName: '节日红',
+      };
+      style.tierKey = 'red';
+      /**
+       * ⚠️⚠️ `levelKey`（键，字符串）和 `level`（对象）是**一对**，必须一起改。
+       *
+       * 这里原来只写了 `style.levelKey = 'red'`，而 `style.level` 还是 `bubbleStyle()`
+       * 给的那个对象（`{ key:'red', rank:3, ... }`）。今天两者恰好都指 'red'，看着没事；
+       * 但这正好是"**键当对象用**"那个雷的温床：谁哪天把 `levelKey` 改成别的键、
+       * 却忘了 `level`，渲染器读 `st.level.rank` 就会读出**另一个档**（颜色/发光不一致），
+       * 或者更糟——读到 `undefined` 而整帧抛非有限、整块气泡区空白。
+       * 所以两个字段一起写，注释钉住：**改一个必须改另一个**。
+       */
+      style.levelKey = 'red';
+      style.level = levelByKey('red');
+      style.radiusRatio = 0.72;                 // 这几天它就该显眼
+      // ⚠️ `radius` 和 `radiusRatio` 是**一对**：渲染器读 radius（泡泡实际多大），
+      //    布局读 radiusRatio。只改一个会出现"看着大、但和文字/颜色说的不一致"。
+      style.radius = 26 + (104 - 26) * style.radiusRatio;
+      style.countdownText = f.countdown || '';
+      style.timeText = f.countdown || '';
+      // 剩余时间用"还剩几天"，气泡大小与通知强度都读它
+      style.remaining = f.daysLeft * 86_400_000;
+      style.band = 'day';
+      style.bandLabel = '节日';
+      // 节日当天 daysLeft = 0 会让 bubbleStyle 判成"已过期"，这里明确纠回来：
+      // 今天就过节，不该长刺变暗紫。
+      style.overdue = false;
+      style.ownOverdue = false;
+      style.overdueInherited = false;
+      style.dimmed = false;
+      style.done = false;
+      style.weekdayLabel = null;
+      style.festival = true;
+
       out.unshift({
         event: f,
-        start: new Date(f.start),
-        end: new Date(f.end),
+        start,
+        end,
         deadline: null,
         key: f.id,
         festival: true,
-        style: {
-          // ⚠️ 颜色走 `tier.color`（渲染层真正用来画泡体的就是它），但**档位 key 仍写 'red'**：
-          //    这样文字排版/白字/统计都还按已有的"重大"那档走，不必让 palette、列表、
-          //    统计到处都去认一个第五档。（"专用颜色"要的是**看得出来的区别**，不是新档位。）
-          tier: {
-            key: 'festival', rank: 3, label: '节日',
-            color: FESTIVAL_COLORS.fill, colorDeep: FESTIVAL_COLORS.fillDark, colorName: '节日红',
-          },
-          tierKey: 'red',
-          levelKey: 'red',
-          radiusRatio: 0.72,                 // 这几天它就该显眼
-          countdownText: f.countdown || '',
-          timeText: f.countdown || '',
-          remaining: f.daysLeft * 86_400_000,
-          band: 'day',
-          bandLabel: '节日',
-          overdue: false,
-          ownOverdue: false,
-          overdueInherited: false,
-          dimmed: false,
-          done: false,
-          weekdayLabel: null,
-          festival: true,
-        },
+        style,
       });
     }
   }

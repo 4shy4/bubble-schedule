@@ -8,10 +8,35 @@
 // 运动：缓慢四处飘浮（无向心引力、无固定中心），靠低频噪声驱动方向，
 //       采用"转向"而不是"撞墙"来处理边界，避免气泡堆在边上。
 // 碰撞：刚体弹开 + 弹性形变（沿碰撞法线挤扁、垂直方向拉长，然后弹回）。
+//
+// ---------------------------------------------------------------------------
+// ⚠️⚠️ 绘制这条路径有一条**必须一直守住**的规矩（2026-09-27 的事故之后写死）：
+//
+//   **一颗泡泡画不出来，绝不许影响别的泡泡。**
+//
+//   事故现场（iPad 0.10.11）：错误条 `The provided value is non-finite`，
+//   而且"整个气泡区看不见泡泡了、可还能点到"。原因是绘制循环里的一次抛出
+//   会冒到 rAF 回调之外：那一帧**剩下的泡泡全都不画**，
+//   连 `requestAnimationFrame(frame)` 都不再执行 —— **整个绘制循环死掉**。
+//   命中判定走几何模型（位置/半径），所以"隐身"但"点得到"。
+//
+//   所以现在 `draw()` 的结构是固定的，改它之前先读这一段：
+//     1. 每颗泡泡的**全部绘制**（算数字 + 画）包在 `try/catch` 里 —— 见 draw()
+//     2. 数字**只在 core/bubble-draw-numbers.js 里算**（纯函数、逐字段兜底、可单测）；
+//        这个文件里**不许**再出现就地算式（`r * 0.955` 这种）——
+//        每多一处就地算式，就多一个"某个字段坏了就整帧空白"的入口
+//     3. 抛了就要**报出是哪一颗、哪个字段**（平板没有控制台，界面是唯一的诊断手段），
+//        然后补画一颗安全的圆（"看得见"永远比"少一颗"强），再继续画下一颗
+//   `tools/bubble-finite.test.mjs` 是这条规矩的尺子（覆盖矩阵 + 假 canvas 当 WebKit）。
+// ---------------------------------------------------------------------------
 import { el, mount } from '../dom.js';
 // 「哪些实例该浮出来」的规则本体在 core（**桌面泡泡共用同一份**，别在这里再写一遍）。
 // `isRepeating` 也一起从那儿拿 —— 本文件原来自己定义了一份，属于同一个坑的种子。
 import { selectBubbleItems, isRepeating, BUBBLE_VIEW_DEFAULTS } from '../../../core/bubble-select.js';
+// 节日泡泡的背景图案（手绘矢量 / 用户自己的图）—— 形状清单在 core，这里只负责画
+import { festivalArt } from '../../../core/festival-art.js';
+// 节日名单（给"给哪个节日换背景图"的下拉用）和节日专用色（预览小图要用）
+import { FESTIVALS, FESTIVAL_COLORS } from '../../../core/holidays.js';
 // 「到期/过期」只有一个定义在 core/state-ops.js（方案 C：到期 = 结束时间）
 import * as stateOps from '../../../core/state-ops.js';
 import { asDate, hhmm } from '../../../core/time.js';
@@ -25,6 +50,13 @@ import {
   LEVELS, levelByKey, canNestInside, allowedChildLevels, isLeafLevel, rankOf,
 } from '../../../core/level.js';
 import { formatRemaining } from '../../../core/countdown.js';
+// 每颗泡泡「喂给 canvas 的全部数字」—— 纯函数在 core，这里只负责测量文字 + 画。
+// ⚠️ 抽出来的理由（用户报的 iPad 故障）：数字散在这一百多行里时，
+//    **一个字段变 NaN 只能靠肉眼在平板上猜**；集中到 core 之后它能被 Node 单测逐字段钉死，
+//    而且每个数都自带兜底 + 记账（哪个字段坏了）。
+import {
+  drawNumbersOf, bubbleDrawDiagnostic, alphaOfStyle, isFiniteNumber, SAFE_RADIUS, SAFE_FALLBACK_ALPHA,
+} from '../../../core/bubble-draw-numbers.js';
 import { emptyState } from '../viewkit.js';
 import { wrapTextToFit, ellipsize } from '../textfit.js';
 import * as store from '../../adapter/store.js';
@@ -69,7 +101,10 @@ const RADIUS_EASE = 6;       // 半径变化速度（1/s）：剩余时间在走
 // ---------- 过期气泡：定点不动 + 暗紫 + 长刺 ----------
 // ⚠️ 两个紫色从 core/palette.js 引入（**桌面泡泡也要画过期**，同一个语义别留两份颜色）
 const OVERDUE_SPIKES = 13;            // 一圈多少根刺
-const OVERDUE_SPIKE_LEN = 0.16;       // 刺长（相对半径）
+// ⚠️ 刺长（相对半径）现在是 `drawNumbersOf` 里算的（`spikeInnerR = r * (1 - 0.16)`），
+//    这个常量只作为那条算式的文档；绘制代码读的是已兜底的 `v.spikeInnerR`。
+const OVERDUE_SPIKE_LEN = 0.16;
+void OVERDUE_SPIKE_LEN;
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
@@ -274,6 +309,8 @@ export const bubbleView = {
     const stop = startSimulation({
       canvas, items, config, ctx, local, pickChip,
       events: state.events,
+      // 用户给某个节日换的图（方案 C）；没换的走矢量图案（方案 A）
+      customArt: (state.settings && state.settings.festivalArt) || {},
     });
     activeStop = stop;
 
@@ -649,6 +686,149 @@ function selectItems(state) {
 // ---------- 说明面板（含少量设置）----------
 // 面板默认隐藏（气泡区全屏展示），点 HUD 上的 ? 才出现。
 // 内容是"解释这个界面"：颜色、大小、操作、套娃规则。
+// ---------- 节日背景图（方案 C：用户自己换） ----------
+//
+// 默认每颗节日泡泡都有一张**手绘矢量图案**（方案 A，见 core/festival-art.js）；
+// 这个块让用户可以把某个节日的图案换成**自己的一张图**。
+//
+// 三个决定，都是被"离线 + 平板 + 别把备份撑爆"逼出来的：
+//   1. 图**存在设置里**（data URL），不是存成文件路径 ——
+//      平板/安卓没有"文件路径"这回事，存路径的话换端就全裂了；存设置里还能跟着备份走。
+//   2. 上传前**先压到 256×256 的 JPEG**。不压的话一张手机照片 3–8 MB，
+//      塞进 db.json 会让每次同步都传好几兆，备份也变得巨大。
+//   3. 只认 `data:image/`（本机压好的），不许用外链 —— 外链在离线/平板上就是白框。
+const CUSTOM_ART_PX = 256;   // 跟 core 里的 CUSTOM_ART_MAX 对齐
+let artPicked = '';          // 下拉里正在编辑的节日（面板重画时保住选择）
+
+/** 把用户选的图片压成 CUSTOM_ART_PX 的方图（cover 裁切）。 */
+function shrinkImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('读不出这个文件'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('这不是一张能解码的图片'));
+      img.onload = () => {
+        const side = CUSTOM_ART_PX;
+        const cv = document.createElement('canvas');
+        cv.width = side;
+        cv.height = side;
+        const c2 = cv.getContext('2d');
+        // 先铺白底：PNG 的透明区压成 JPEG 会变黑，黑块贴在红泡泡上很难看
+        c2.fillStyle = '#ffffff';
+        c2.fillRect(0, 0, side, side);
+        const ratio = Math.max(side / img.naturalWidth, side / img.naturalHeight);
+        const w = img.naturalWidth * ratio;
+        const h = img.naturalHeight * ratio;
+        c2.drawImage(img, (side - w) / 2, (side - h) / 2, w, h);
+        resolve(cv.toDataURL('image/jpeg', 0.82));
+      };
+      img.src = String(reader.result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function festivalArtBlock(state, rerender) {
+  const saved = (state.settings && state.settings.festivalArt) || {};
+  const choices = [];
+  for (const f of FESTIVALS) if (!choices.some((k) => k.key === f.key)) choices.push({ key: f.key, name: f.name });
+  if (!choices.length) return el('div.spacer');
+  if (!artPicked || !choices.some((k) => k.key === artPicked)) artPicked = choices[0].key;
+
+  const status = el('span.bubble-art-status', {});
+  const nowLabel = el('span.bubble-tool-label', {});
+
+  // 设置里直接给一张**小预览图**：不然"选完了长什么样"只能回到气泡区去猜，
+  // 而节日泡泡要等到"还剩 N 天"才浮出来 —— 想看一眼得等好几个月，等于没法验收。
+  const PV = 44;
+  const dpr = Math.min(3, window.devicePixelRatio || 1);
+  const preview = el('canvas.bubble-art-preview', {
+    width: String(Math.round(PV * dpr)),
+    height: String(Math.round(PV * dpr)),
+    style: { width: `${PV}px`, height: `${PV}px` },
+    title: '当前图案的预览',
+  });
+  const drawPreview = () => {
+    const c2 = preview.getContext('2d');
+    if (!c2) return;
+    c2.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c2.clearRect(0, 0, PV, PV);
+    const R = PV / 2 - 1;
+    const cx = PV / 2;
+    const cy = PV / 2;
+    const body = c2.createRadialGradient(cx - R * 0.3, cy - R * 0.35, R * 0.05, cx, cy, R * 1.02);
+    body.addColorStop(0, FESTIVAL_COLORS.fillLight);
+    body.addColorStop(0.55, FESTIVAL_COLORS.fill);
+    body.addColorStop(1, FESTIVAL_COLORS.fillDark);
+    c2.beginPath();
+    c2.arc(cx, cy, R, 0, Math.PI * 2);
+    c2.fillStyle = body;
+    c2.fill();
+    drawFestivalArt(c2, { x: cx, y: cy }, R, artPicked, saved, 1);
+    c2.beginPath();
+    c2.arc(cx, cy, R - 1, 0, Math.PI * 2);
+    c2.lineWidth = 1.5;
+    c2.strokeStyle = FESTIVAL_COLORS.ring;
+    c2.globalAlpha = 0.85;
+    c2.stroke();
+    c2.globalAlpha = 1;
+  };
+
+  const refresh = () => {
+    const a = festivalArt(artPicked, { customArt: saved });
+    nowLabel.textContent = a.custom ? '当前：你自己选的图片' : `当前：矢量图案「${a.label}」`;
+    status.textContent = saved[artPicked] ? '已换图' : '';
+    drawPreview();
+  };
+  refresh();
+
+  const picker = el('input', {
+    type: 'file',
+    accept: 'image/*',
+    style: { display: 'none' },
+    onchange: async (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';                                  // 允许连着选同一个文件
+      if (!file) return;
+      try {
+        const dataUrl = await shrinkImageFile(file);
+        await store.saveSettings({ festivalArt: { ...saved, [artPicked]: dataUrl } });
+        rerender();
+      } catch (err) {
+        status.textContent = (err && err.message) ? `${err.message}，换一张试试` : '这张图用不了，换一张试试';
+      }
+    },
+  });
+
+  return el('div.bubble-panel-row.bubble-art-row', {}, [
+    el('span.bubble-tool-label', { text: '节日背景图' }),
+    preview,
+    el('select.bubble-art-select', {
+      'aria-label': '要换背景图的节日',
+      onchange: (e) => { artPicked = e.target.value; refresh(); },
+    }, choices.map((k) => el('option', {
+      value: k.key,
+      selected: k.key === artPicked,
+      text: saved[k.key] ? `${k.name} · 已换图` : k.name,
+    }))),
+    nowLabel,
+    el('button.btn.btn-sm', { text: '选一张图', onclick: () => picker.click() }),
+    el('button.btn.btn-sm', {
+      text: '恢复矢量图案',
+      onclick: async () => {
+        if (!saved[artPicked]) { status.textContent = '本来就是矢量图案'; return; }
+        const next = { ...saved };
+        delete next[artPicked];
+        await store.saveSettings({ festivalArt: next });
+        rerender();
+      },
+    }),
+    picker,
+    status,
+  ]);
+}
+
 function renderPanel(host, legendHost, config, ctx, local, state) {
   const seg = (options, current, onPick) => el('div.seg', {}, options.map((o) =>
     el('button', {
@@ -803,6 +983,7 @@ function renderPanel(host, legendHost, config, ctx, local, state) {
       }),
       el('span.bubble-tool-label', { text: '天前出现（0 = 不显示）' }),
     ]),
+    festivalArtBlock(state, rerender),
     // 课程开关（用户要求）：课程是周期性的，气泡区更适合放临时事务。
     // 用 `label.switch-row` 的现成样式（勾选框 + 文字一行，点哪都能切换）。
     el('label.switch-row.bubble-course-toggle', {}, [
@@ -911,7 +1092,7 @@ function renderLegend(host) {
 }
 
 // ---------- 动力学模拟 ----------
-function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  const ctx2d = canvas.getContext('2d');
+function startSimulation({ canvas, items, config, ctx, local, events = [], customArt = {} }) {  const ctx2d = canvas.getContext('2d');
   if (!ctx2d) return () => {};
 
   const dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -922,7 +1103,12 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
   let time = 0;
 
   const bodies = items.map((item, i) => {
-    const r = item.style.radius;
+    // ⚠️ 这里是一颗泡泡的"尺寸入口"，**必须挡住非法值**。
+    //    踩过：节日泡泡的 style 漏了 radius → 这里是 undefined → mass 变 NaN
+    //    → 位置全变 NaN → createRadialGradient 抛异常 → 整个气泡区空白。
+    //    宁可这一颗用兜底尺寸（40），也不能让一个坏字段把整块画布带走。
+    const rawR = item.style && item.style.radius;
+    const r = Number.isFinite(rawR) && rawR > 0 ? rawR : 40;
     const angle = i * 2.399963;
     return {
       item,
@@ -1220,6 +1406,372 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
   }
 
   // ---------- 绘制 ----------
+  /**
+   * 一颗泡泡画挂了 → **在界面上说出是哪一颗、哪个字段坏的**。
+   *
+   * ⚠️ 为什么必须弹给用户看（而不是只 console.error）：
+   *   现场是 iPad，**没有 DevTools、没有控制台**。用户能提供的只有"App 出了个错"。
+   *   所以这条 toast 是**远程诊断的唯一手段**：它要说清「哪颗泡泡 / 哪个量 / 相关字段的值」。
+   *
+   * ⚠️ 两种坏消息都要能报出来，而且不能互相吃掉：
+   *   · `calc`：一颗泡泡的**数字**里有 NaN（`drawNumbersOf` 兜住了，但字段名要报）
+   *   · `draw`：数字都正常，却**在画的时候**抛了（未预料到的 canvas 调用）
+   *   只报第一种会漏掉真正的绘制异常；只报第二种就说不清"是哪个字段"。
+   */
+  const bubbleErrorKeys = new Set();
+  const reportedProblemFields = new Set();
+  /** @param {object} b @param {'calc'|'draw'} kind @param {Array} problems @param {Error} [err] */
+  function reportBubbleFailure(b, kind, problems, err) {
+    const fields = (problems || []).map((p) => p.field);
+    const key = `${b.key}|${fields.join(',')}|${kind}|${(err && err.message) || ''}`;
+    if (bubbleErrorKeys.has(key)) return;      // 同一颗、同一个原因，只报一次
+    bubbleErrorKeys.add(key);
+    // `safe` = 整颗都画挂了（这时通常没有具体字段，措辞要说清"已补画一颗圆"）
+    const detail = bubbleDrawDiagnostic(b.item, problems, kind === 'draw' ? 'safe' : 'repair');
+    const isNewField = fields.some((f) => !reportedProblemFields.has(f));
+    fields.forEach((f) => reportedProblemFields.add(f));
+    try {
+      console.error(`[bubble] ${kind === 'calc' ? '算出了非法数字' : '画不出来'}：${detail}`, err || '');
+      // 同一条根因（同一批字段）已经在屏幕上留过一条了 → 不再重复弹窗，免得把泡泡区刷满
+      if (kind === 'calc' && !isNewField) return;
+      toast({
+        title: kind === 'calc' ? '泡泡的大小/位置算错了' : '有一颗泡泡画不出来',
+        // ⚠️ 异常原文要留着：真机上报回来的那句话，是和我们这张表对齐的唯一证据
+        body: `${detail}${err && err.message ? `｜异常：${err.message}` : ''}`,
+        kind: 'err',
+        timeout: 12000,
+      });
+    } catch { /* toast/console 自己炸了不能再抛，否则每帧递归 */ }
+  }
+
+  /**
+   * 最小安全画法：**画一颗看得见的圆**（颜色用它的档位色、透明度低一点）。
+   *
+   * 这条兜底的目的是"不消失"：用户报的是"泡泡隐身了但还能点到"，
+   * 那就宁可画一颗朴素的圆，也不要让这一颗从视觉上消失（那会让人以为数据丢了）。
+   */
+  function drawSafeBubble(b, alpha) {
+    const st = b.item.style || {};
+    // 档位色：优先用 style.tier（节日泡泡的专用色就是它），没有就按 key 查回真档。
+    // ⚠️ 别在这里写死一个 '#38bdf8' 兜底 —— 那会让"红泡泡"画成蓝的，
+    //    比"少一颗"更容易让人误判（以为是数据错了）。
+    const tier = (st.tier && typeof st.tier === 'object' && typeof st.tier.color === 'string') ? st.tier
+      : tierByKey(st.tierKey || st.levelKey);
+    const color = (tier && typeof tier.color === 'string') ? tier.color : '#38bdf8';
+    const r = isFiniteNumber(b.r) && b.r > 0 ? b.r : SAFE_RADIUS;
+    const x = isFiniteNumber(b.x) ? b.x : 0;
+    const y = isFiniteNumber(b.y) ? b.y : 0;
+    // 透明度：能算出就沿用（正常泡泡兜底时观感不变），算不出才用更低的那一档
+    const a = isFiniteNumber(alpha) ? alpha : SAFE_FALLBACK_ALPHA;
+    try {
+      ctx2d.beginPath();
+      ctx2d.arc(x, y, r, 0, Math.PI * 2);
+      ctx2d.fillStyle = hexToRgba(color, 0.5 * a);
+      ctx2d.fill();
+      ctx2d.lineWidth = Math.max(1, r * 0.03);
+      ctx2d.strokeStyle = hexToRgba(color, 0.9 * a);
+      ctx2d.stroke();
+    } catch { /* 连圆都画不出来就只能放弃了（不能让它把整帧带走） */ }
+  }
+
+  /**
+   * 画**一颗**泡泡的全部内容。
+   *
+   * ⚠️ 这个函数的边界是这次事故的止血点：调用方（draw）用 try/catch 把它整个包住，
+   *    所以**一颗泡泡抛异常绝不会影响别的泡泡**。
+   *    以前是一百多行直接摊在 `for` 循环里 —— 一次抛出就打断整帧，
+   *    用户看到的是"整个气泡区空白"（而不是"少一颗"），这就是"隐身"的由来。
+   */
+  function paintBubble(b, v, lines) {
+    const st = b.item.style;
+    // ⚠️ `st.tier` 也可能是坏的（null / 字符串 / 没颜色）。以前这里写的是
+    //    `ownOverdue ? OVERDUE_COLOR : tier.color` —— tier 一坏就是 TypeError，
+    //    而 TypeError 同样会**打断整帧**（症状和"非有限"一模一样）。
+    //    所以档位色也走"合法就用、不合法查回真档"这一条路。
+    const tier = (st.tier && typeof st.tier === 'object' && typeof st.tier.color === 'string')
+      ? st.tier : tierByKey(st.tierKey || st.levelKey);
+    const isSelected = local.selected && local.selected.bubble === b;
+    const tierC = v.ownOverdue ? OVERDUE_COLOR : tier.color;
+    const litC = mixColor(tierC, '#ffffff', 0.42);
+    const bodyC = mixColor(tierC, '#ffffff', 0.06);
+    const shadowC = mixColor(tierC, '#0b1220', 0.45);
+    const alpha = v.alpha;
+    const r = v.r;
+    const theta = v.theta;
+    const scalePerp = v.scalePerp;
+    const scaleAlong = v.scaleAlong;
+    const ldx = -Math.SQRT1_2;
+    const ldy = -Math.SQRT1_2;
+
+    // -----------------------------------------------------------------------
+    // 真气泡的画法（参考 glassmorphism / 玻璃折射的通行做法）：
+    //   1) 软外晕          —— 把气泡"垫"在背景上
+    //   2) 受光的球体      —— 左上亮、右下暗；外轮廓留一圈色，否则会糊
+    //   3) 边缘光带        —— 很薄的一圈浅色渐变，不是实心粗亮环
+    //   4) 镜面轮廓光      —— 偏一侧的弧形亮带 + 背光侧浅暗边 = 体积感
+    //   5) 双高光          —— 一个大的柔光斑 + 一个很小的细点（真实反射）
+    //   6) 底部内暗影      —— 圆的下缘积暗，立体感
+    //   7) 文字            —— 淡暗色垫片 + 柔和描边，保证半透明底上的可读性
+    // -----------------------------------------------------------------------
+
+    // 0) 过期的刺：从泡壁**向内**长一圈尖刺（用户要求"向内长出一圈刺"）。
+    //    先画，后面泡体盖上去，只留刺尖露在泡内，看起来是扎进泡里的。
+    //    只有「自己过期」才长刺 —— 容器过期的那颗自己还没到期，不该被刺。
+    if (v.ownOverdue) drawOverdueSpikes(ctx2d, b, v);
+
+    // 1) 软外晕
+    const glow = ctx2d.createRadialGradient(v.x, v.y, v.r * 0.7, v.x, v.y, v.r * v.glowScale);
+    glow.addColorStop(0, hexToRgba(tierC, 0.16 * alpha));
+    glow.addColorStop(1, hexToRgba(tierC, 0));
+    ctx2d.fillStyle = glow;
+    ctx2d.beginPath();
+    ctx2d.arc(v.x, v.y, v.r * v.glowScale, 0, Math.PI * 2);
+    ctx2d.fill();
+
+    // 2) 泡体：左上偏亮、右下偏深。外轮廓要有一圈色，但只能**很薄的一圈**：
+    //    圈一厚就变成"透镜/按钮"，而不是泡（真机放大后就是这个观感）。
+    const body = ctx2d.createRadialGradient(v.lx, v.ly, v.bodyInnerR, v.x, v.y, v.bodyOuterR);
+    body.addColorStop(0.00, hexToRgba(litC, 0.30 * alpha));
+    body.addColorStop(0.42, hexToRgba(bodyC, 0.17 * alpha));
+    body.addColorStop(0.80, hexToRgba(tierC, 0.24 * alpha));
+    body.addColorStop(0.97, hexToRgba(shadowC, 0.34 * alpha));
+    body.addColorStop(1.00, hexToRgba(shadowC, 0.10 * alpha));
+    ellipsePath(ctx2d, v, 1);
+    ctx2d.fillStyle = body;
+    ctx2d.fill();
+
+    // 2.5) 节日泡泡：铺一层背景图案（月亮/灯笼/粽子…，或用户自己换的图）。
+    //      只给节日泡泡画 —— 普通事项泡泡上糊个图案会变成噪声。
+    //
+    // ⚠️ 这里**必须兜住异常**：图案来自 core/festival-art.js 的形状清单 + 用户自己换的图，
+    //    抛一次就是"这一颗少一张背景"（现在更是只影响这一颗，见 paintBubble 的边界）。
+    const festKey = b.item && b.item.event && b.item.event.festivalKey;
+    if (festKey) {
+      try {
+        drawFestivalArt(ctx2d, b, v.r, festKey, customArt, alpha);
+      } catch (err) {
+        if (!artDrawWarned) {
+          artDrawWarned = true;
+          console.error('[节日图案] 画不出来，已跳过（只报一次）：', festKey, err);
+        }
+        ctx2d.restore && ctx2d.restore();
+      }
+    }
+
+    // 3) 边缘光带：更薄、更淡的一圈浅色渐变（原来 0.93R/0.38 偏重，会形成双环）。
+    const rim = ctx2d.createRadialGradient(v.x, v.y, v.rimInnerR, v.x, v.y, v.rimOuterR);
+    rim.addColorStop(0.00, hexToRgba(litC, 0));
+    rim.addColorStop(0.80, hexToRgba(litC, 0.03 * alpha));
+    rim.addColorStop(0.95, hexToRgba(litC, 0.20 * alpha));
+    rim.addColorStop(1.00, hexToRgba(litC, 0.03 * alpha));
+    ellipsePath(ctx2d, v, 1);
+    ctx2d.fillStyle = rim;
+    ctx2d.fill();
+
+    // 4) 被照亮那一侧的轮廓光：偏左上的一段弧，是玻璃感的主要来源。
+    ctx2d.beginPath();
+    ctx2d.ellipse(v.x, v.y, v.outlineR * scalePerp, v.outlineR * scaleAlong, theta, 0, Math.PI * 2);
+    ctx2d.lineWidth = v.outlineWidth;
+    ctx2d.lineCap = 'round';
+    const arcA = Math.atan2(ldy, ldx);
+    const arc = Math.PI * 1.05;
+    void arc;
+    const rimLight = ctx2d.createLinearGradient(
+      v.x + Math.cos(arcA) * r, v.y + Math.sin(arcA) * r,
+      v.x - Math.cos(arcA) * r, v.y - Math.sin(arcA) * r,
+    );
+    rimLight.addColorStop(0, `rgba(255,255,255,${(st.done ? 0.20 : 0.56) * alpha})`);
+    rimLight.addColorStop(0.55, `rgba(255,255,255,${(st.done ? 0.08 : 0.22) * alpha})`);
+    rimLight.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx2d.strokeStyle = rimLight;
+    ctx2d.stroke();
+    // 背光侧压一道浅暗边，泡泡才有体积（不然看着像贴纸）。
+    // 弧必须画得够长、两端必须淡到 0，否则它和受光弧的接缝会露出来一条"鬼影"斜线。
+    const arcBack = Math.PI * 0.62;
+    const shadowArc = ctx2d.createLinearGradient(
+      v.x + Math.cos(arcA + Math.PI) * r, v.y + Math.sin(arcA + Math.PI) * r,
+      v.x - Math.cos(arcA + Math.PI) * r, v.y - Math.sin(arcA + Math.PI) * r,
+    );
+    shadowArc.addColorStop(0.00, 'rgba(11,18,32,0)');
+    shadowArc.addColorStop(0.16, `rgba(11,18,32,${0.20 * alpha})`);
+    shadowArc.addColorStop(0.46, 'rgba(11,18,32,0)');
+    shadowArc.addColorStop(1.00, 'rgba(11,18,32,0)');
+    ctx2d.strokeStyle = shadowArc;
+    ctx2d.beginPath();
+    ctx2d.ellipse(v.x, v.y, v.shadowArcR * scalePerp, v.shadowArcR * scaleAlong, theta,
+      arcA + Math.PI - arcBack, arcA + Math.PI + arcBack);
+    ctx2d.stroke();
+    ctx2d.lineCap = 'butt';
+
+    // 5) 高光：真气泡上的反射**没有边界**。
+    //    v2 用"压扁的圆"画，被拉长的那个圆其边缘曲率跟着变形，看起来就是一片
+    //    贴在泡上的椭圆色块（真机上一眼假）。这里改成**纯粹由渐变构成的亮度场**：
+    //    只有圆心和径向衰减，没有"块的轮廓"。
+    //    位置也必须挪到 **0.74R 的贴边处**：文字的排版块会占到 ±0.36R，
+    //    高光放在泡中央会正好压在字上（真机实测就是这个问题）。
+    const glint = ctx2d.createRadialGradient(v.glintX, v.glintY, 0, v.glintX, v.glintY, v.glintR);
+    glint.addColorStop(0.00, `rgba(255,255,255,${(st.done ? 0.05 : 0.16) * alpha})`);
+    glint.addColorStop(0.45, `rgba(255,255,255,${(st.done ? 0.02 : 0.07) * alpha})`);
+    glint.addColorStop(1.00, 'rgba(255,255,255,0)');
+    ctx2d.beginPath();
+    ctx2d.arc(v.glintX, v.glintY, v.glintR, 0, Math.PI * 2);
+    ctx2d.fillStyle = glint;
+    ctx2d.fill();
+
+    const spark = ctx2d.createRadialGradient(v.glintX, v.glintY, 0, v.glintX, v.glintY, v.sparkR);
+    spark.addColorStop(0.00, `rgba(255,255,255,${(st.done ? 0.12 : 0.26) * alpha})`);
+    spark.addColorStop(0.50, `rgba(255,255,255,${(st.done ? 0.04 : 0.09) * alpha})`);
+    spark.addColorStop(1.00, 'rgba(255,255,255,0)');
+    ctx2d.beginPath();
+    ctx2d.arc(v.glintX, v.glintY, v.sparkR, 0, Math.PI * 2);
+    ctx2d.fillStyle = spark;
+    ctx2d.fill();
+
+    // 5b) 非常淡的中央亮场：不是为了"高光"，是为了让泡体有个球心，
+    //     否则去掉那团假高光之后泡面会显得平。半径大、峰值低，所以看不出形状。
+    const centerGlow = ctx2d.createRadialGradient(
+      v.centerGlowX, v.centerGlowY, 0,
+      v.centerGlowX, v.centerGlowY, v.centerGlowR,
+    );
+    centerGlow.addColorStop(0.00, `rgba(255,255,255,${(st.done ? 0.03 : 0.10) * alpha})`);
+    centerGlow.addColorStop(0.55, `rgba(255,255,255,${(st.done ? 0.01 : 0.04) * alpha})`);
+    centerGlow.addColorStop(1.00, 'rgba(255,255,255,0)');
+    ellipsePath(ctx2d, v, 1);
+    ctx2d.fillStyle = centerGlow;
+    ctx2d.fill();
+
+    // 6) 底部内暗影：圆的下缘积一点暗，立体感立刻出来（暗得太重会变"按钮"）
+    ctx2d.save();
+    ellipsePath(ctx2d, v, 1);
+    ctx2d.clip();
+    const inner = ctx2d.createRadialGradient(
+      v.innerX, v.innerY, v.innerInnerR,
+      v.x, v.y, v.innerOuterR,
+    );
+    inner.addColorStop(0.58, 'rgba(11,18,32,0)');
+    inner.addColorStop(0.86, `rgba(11,18,32,${0.08 * alpha})`);
+    inner.addColorStop(1.00, `rgba(11,18,32,${0.17 * alpha})`);
+    ctx2d.fillStyle = inner;
+    ctx2d.fillRect(v.innerRectX, v.innerRectY, v.innerRectW, v.innerRectH);
+    ctx2d.restore();
+
+    // 7) 选中态：外面加一圈深色描边（比白色更清楚）
+    if (isSelected) {
+      ellipsePath(ctx2d, v, 1);
+      ctx2d.lineWidth = v.selectStrokeWidth;
+      ctx2d.strokeStyle = luminance(tierC) > 0.45 ? 'rgba(20,26,40,.75)' : 'rgba(255,255,255,.9)';
+      ctx2d.stroke();
+    } else {
+      // 常规外描边：一条极细的深色边，把泡泡从背景里"切"出来
+      ellipsePath(ctx2d, v, 1);
+      ctx2d.lineWidth = v.strokeWidth;
+      ctx2d.strokeStyle = v.overdue
+        ? hexToRgba(OVERDUE_EDGE, 0.55 * alpha)
+        : `rgba(15,23,42,${0.14 * alpha})`;
+      ctx2d.stroke();
+    }
+
+    // 7b) 长按进度环：按住 2.5 秒就戳破，环走满即触发
+    if (v.hold > 0.001) {
+      ctx2d.beginPath();
+      ctx2d.arc(v.x, v.y, v.holdRingR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * v.hold);
+      ctx2d.lineWidth = v.holdWidth;
+      ctx2d.lineCap = 'round';
+      ctx2d.strokeStyle = `rgba(239,68,68,${0.55 + 0.35 * v.hold})`;
+      ctx2d.stroke();
+      ctx2d.lineCap = 'butt';
+    }
+
+    // 7a) 「容器过期」标记：一圈暗紫**虚线**环。
+    //
+    // 为什么要单独一种画法：这颗泡泡自己没到期（文字写的是"剩余 N 天"），
+    // 只是它所在的容器过期了。整颗变紫会让文字和颜色互相矛盾（用户报的 bug）。
+    // 虚线环表达"有约束加在你身上，但你自己还没到期"——和实心紫（自己过期）区分得开。
+    if (v.inheritedOverdue) {
+      ctx2d.save();
+      ctx2d.beginPath();
+      ctx2d.arc(v.x, v.y, v.inheritedRingR, 0, Math.PI * 2);
+      ctx2d.setLineDash([v.inheritedDashA, v.inheritedDashB]);
+      ctx2d.lineWidth = v.inheritedRingWidth;
+      ctx2d.strokeStyle = hexToRgba(OVERDUE_COLOR, 0.85 * alpha);
+      ctx2d.stroke();
+      ctx2d.restore();
+    }
+
+    if (r >= 18) {
+      const textColor = tierTextColor(st.tierKey);
+      // 暗色字 → 浅色底衬；亮色字 → 深色底衬。底衬**必须和圆的形状一致**：
+      // v2 用的是一块矩形渐变，真机放大后能清楚看到方形边缘戳在圆里，非常假。
+      const darkText = luminance(textColor) < 0.5;
+      ctx2d.textAlign = 'center';
+      ctx2d.textBaseline = 'middle';
+      // ⚠️ 字号/行高/垫板位置全部来自 core 的 drawNumbersOf（那里逐字段兜过底）；
+      //    这里只负责把已经算好的数交给 canvas —— 多一个就地算式就多一个 NaN 入口。
+      const titleSize = v.titleSize;
+      ctx2d.font = `650 ${v.measuredFontSize}px system-ui, "Segoe UI", sans-serif`;
+      const lineH = v.lineH;
+      const blockH = v.blockH;
+      const showSub = v.showSub;
+      const showLevel = v.showLevel;
+      const subSize = v.subSize;
+      const textTop = v.textTop;
+      const textBottom = v.textBottom;
+
+      if (!darkText) {
+        // 亮色字：一层圆形的径向暗晕垫在文字后面（没有边，不会露出方块）
+        const plate = ctx2d.createRadialGradient(v.x, v.plateCY, 0, v.x, v.plateCY, v.plateR);
+        plate.addColorStop(0.00, `rgba(9,14,26,${0.30 * alpha})`);
+        plate.addColorStop(0.62, `rgba(9,14,26,${0.16 * alpha})`);
+        plate.addColorStop(1.00, 'rgba(9,14,26,0)');
+        ctx2d.beginPath();
+        ctx2d.arc(v.x, v.plateCY, v.plateR, 0, Math.PI * 2);
+        ctx2d.fillStyle = plate;
+        ctx2d.fill();
+      }
+      void textBottom;
+
+      ctx2d.save();
+      ctx2d.lineJoin = 'round';
+      ctx2d.lineWidth = Math.max(2, titleSize * (darkText ? 0.26 : 0.24));
+      ctx2d.strokeStyle = darkText
+        ? `rgba(255,255,255,${0.42 * alpha})`
+        : `rgba(9,14,26,${0.32 * alpha})`;
+      ctx2d.fillStyle = textColor;
+      let ty = textTop;
+      for (const line of lines) {
+        ctx2d.strokeText(line, v.x, ty + titleSize / 2);
+        ctx2d.fillText(line, v.x, ty + titleSize / 2);
+        ty += lineH;
+      }
+
+      if (showSub) {
+        ctx2d.font = `650 ${subSize}px system-ui, "Segoe UI", sans-serif`;
+        ctx2d.lineWidth = v.subStrokeWidth;
+        // 第一行是"还剩多久"（v0.4 的主角），时间点跟在后面。
+        // ⚠️ 重复事件的实例还要带**周几** —— 一周勾了 7 天时，
+        //    7 个泡泡标题一样、时间数字也可能一样，只有周几能区分是哪一个。
+        //    （用户报："我选了 7 个泡泡你不能都显示剩一个时间吧，要有周几的区别"）
+        const sub = st.weekdayLabel
+          ? `${st.countdownText} · 周${st.weekdayLabel} ${hhmm(b.item.start)}`
+          : `${st.countdownText} · ${hhmm(b.item.start)}`;
+        ctx2d.strokeText(sub, v.x, v.subY);
+        ctx2d.fillStyle = textColor;
+        ctx2d.globalAlpha = 0.95;
+        ctx2d.fillText(sub, v.x, v.subY);
+        ctx2d.globalAlpha = 1;
+      }
+      if (showLevel) {
+        ctx2d.font = `700 ${v.tagPostSize}px system-ui, sans-serif`;
+        ctx2d.lineWidth = v.tagStrokeWidth;
+        const tag = `● ${(st.level && st.level.label) || ''}`;
+        ctx2d.strokeText(tag, v.x, v.tagY);
+        ctx2d.fillStyle = hexToRgba('#ffffff', 0.92 * alpha);
+        ctx2d.fillText(tag, v.x, v.tagY);
+      }
+      ctx2d.restore();
+    }
+  }
+
   function draw() {
     ctx2d.clearRect(0, 0, width, height);
 
@@ -1227,316 +1779,58 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
     // "离开容器"改由"拖到左侧栏"完成 —— 左侧栏在拖动时会变成投放区。
 
     for (const b of bodies) {
-      const st = b.item.style;
-      const tier = st.tier;
-      const isSelected = local.selected && local.selected.bubble === b;
-      // 已完成的（done）最淡；其次是"超出预览范围"的（用户选 14 天 → 14 天后的，虚化预告）
-  const alpha = st.done ? 0.34 : (st.dimmed ? 0.42 : 0.88);
-      const r = b.r;
+      /**
+       * ⚠️⚠️ 这是这次事故（iPad 上 `The provided value is non-finite` + 泡泡隐身）
+       * 的**止血点**：每颗泡泡的"算数字 + 画"整段包在 try/catch 里。
+       *
+       *   为什么必须包在这里（而不是只包节日图案那一段）：
+       *     `for` 循环里任何一次抛出都会冒到 rAF 回调外 —— 那一帧剩下的泡泡**全都不画**，
+       *     而且 `requestAnimationFrame(frame)` 那句也不再执行，**整个绘制循环就此死掉**。
+       *     用户看到的就是"气泡区一片空白"，但命中判定走几何模型，所以"还能点到"。
+       *
+       *   一颗坏泡泡的代价必须**只限于它自己**：这里抛了就补画一颗安全的圆，
+       *   然后**继续画下一颗**。
+       */
+      try {
+        // ---- 第一步：把这一帧要用的数字**集中算出来**（纯函数，在 core）----
+        //      `measure` 是文字排版（依赖 ctx.measureText），所以由这里传进去。
+        const calc = drawNumbersOf(b.item, {
+          x: b.x, y: b.y, r: b.r,
+          theta: Math.atan2(b.ny, b.nx),
+          squash: b.squash,
+          hold: b.hold,
+          // 被撞/被按时的抖动（帧相关，纯函数算不出来，所以只能传进去）。
+          // ⚠️ 别在这里"顺手取整"：这个数直接决定绘制偏移，取整就是改观感。
+          //    上限由 core 的 SHAKE_MAX(10) 兜着，正常值（≤ 4.5）原样通过。
+          shakeX: b.shake > 0 ? Math.sin(performance.now() * 0.05) * (b.shake * 2.2) : 0,
+        }, {
+          measure: (title, maxWidth, fontSize, maxLines) =>
+            wrapTextToFit(ctx2d, title, maxWidth, fontSize, maxLines),
+        });
+        // 算数字时发现坏字段 → 先把现场报出去（画还是要画，用的是兜底值）
+        if (calc.problems.length) reportBubbleFailure(b, 'calc', calc.problems);
 
-      // 过期未戳破：定点不动、颜色变暗紫、向内长一圈刺（用户指定的表现）
-      //
-      // ⚠️ 这里必须区分两种"过期"，否则文字和颜色会互相矛盾（用户报的 bug）：
-      //   · **自己过期**（ownOverdue）→ 整颗变暗紫 + 长刺（原样保留）
-      //   · **只有祖先过期**（overdueInherited）→ **保持自己的等级颜色**，
-      //     另画一圈暗紫虚线环表示"它所在的容器过期了"。
-      //   原来两者都整颗变紫，于是"剩余 3 天"的泡泡看着像已经废了。
-      const overdue = !!st.overdue;
-      const ownOverdue = !!st.ownOverdue;
-      const inheritedOverdue = overdue && !ownOverdue;
+        // ⚠️ 跟几何模型对账：命中判定读的是 `b.x/b.y/b.r`，绘制读的是兜底后的数字。
+        //    两者不一致就会出现"看得见、点不到"（或反过来）。
+        //    所以**一旦发现物理状态里有非有限值，就把它修回有限值**（同一颗，同一次）。
+        let repaired = false;
+        if (!isFiniteNumber(b.x)) { b.x = calc.values.x; repaired = true; }
+        if (!isFiniteNumber(b.y)) { b.y = calc.values.y; repaired = true; }
+        if (!isFiniteNumber(b.r) || b.r <= 0) { b.r = calc.values.r; repaired = true; }
+        if (!isFiniteNumber(b.squash)) { b.squash = 0; repaired = true; }
+        if (!isFiniteNumber(b.nx)) b.nx = 1;
+        if (!isFiniteNumber(b.ny)) b.ny = 0;
+        if (!isFiniteNumber(b.shake)) b.shake = 0;
+        if (!isFiniteNumber(b.hold)) b.hold = 0;
+        if (!isFiniteNumber(b.targetR) || b.targetR <= 0) b.targetR = calc.values.r;
+        if (repaired) reportBubbleFailure(b, 'calc', [{ field: '物理状态(x/y/r/squash…)', value: 'NaN' }]);
 
-      // 形变：沿法线压扁、垂直方向拉长（面积近似守恒）。
-      // 上限压得很紧（0.2），所以视觉上只是"微微挤一下"，不会变成橡皮球。
-      const s = clamp(b.squash, -SQUASH_MAX, SQUASH_MAX);
-      const scaleAlong = clamp(1 - s, 0.78, 1.22);
-      const scalePerp = clamp(1 + s * 0.8, 0.8, 1.2);
-      const theta = Math.atan2(b.ny, b.nx);
-
-      // 被撞/被长按时抖一下（过期气泡"扎手"的反馈）
-      const shakeAmt = b.shake > 0 ? b.shake * 2.2 : 0;
-      const shakeX = shakeAmt ? Math.sin(performance.now() * 0.05) * shakeAmt : 0;
-
-      const ellipse = (ctx, scale) => {
-        ctx.beginPath();
-        ctx.ellipse(
-          b.x + shakeX, b.y,
-          r * scalePerp * scale, r * scaleAlong * scale,
-          theta, 0, Math.PI * 2,
-        );
-      };
-
-      // ---------------------------------------------------------------------
-      // 真气泡的画法（参考 glassmorphism / 玻璃折射的通行做法）：
-      //   1) 软外晕          —— 把气泡"垫"在背景上
-      //   2) 受光的球体      —— 左上亮、右下暗；外轮廓留一圈色，否则会糊
-      //   3) 边缘光带        —— 很薄的一圈浅色渐变，不是实心粗亮环
-      //   4) 镜面轮廓光      —— 偏一侧的弧形亮带 + 背光侧浅暗边 = 体积感
-      //   5) 双高光          —— 一个大的柔光斑 + 一个很小的细点（真实反射）
-      //   6) 底部内暗影      —— 圆的下缘积暗，立体感
-      //   7) 文字            —— 淡暗色垫片 + 柔和描边，保证半透明底上的可读性
-      // ---------------------------------------------------------------------
-      const tierC = ownOverdue ? OVERDUE_COLOR : tier.color;
-      // 光从左上打进来：所有高光/明暗都按这个方向排布，泡泡才有"球"的感觉
-      const lx = b.x - r * 0.32;
-      const ly = b.y - r * 0.38;
-      const ldx = -Math.SQRT1_2;
-      const ldy = -Math.SQRT1_2;
-      const litC = mixColor(tierC, '#ffffff', 0.42);
-      const bodyC = mixColor(tierC, '#ffffff', 0.06);
-      const shadowC = mixColor(tierC, '#0b1220', 0.45);
-
-      // 0) 过期的刺：从泡壁**向内**长一圈尖刺（用户要求"向内长出一圈刺"）。
-      //    先画，后面泡体盖上去，只留刺尖露在泡内，看起来是扎进泡里的。
-      //    只有「自己过期」才长刺 —— 容器过期的那颗自己还没到期，不该被刺。
-      if (ownOverdue) drawOverdueSpikes(ctx2d, b, r, theta);
-
-      // 1) 软外晕
-      const glowScale = 1.16 + (st.level ? st.level.rank : 0) / 40;
-      const glow = ctx2d.createRadialGradient(b.x, b.y, r * 0.7, b.x, b.y, r * glowScale);
-      glow.addColorStop(0, hexToRgba(tierC, 0.16 * alpha));
-      glow.addColorStop(1, hexToRgba(tierC, 0));
-      ctx2d.fillStyle = glow;
-      ctx2d.beginPath();
-      ctx2d.arc(b.x, b.y, r * glowScale, 0, Math.PI * 2);
-      ctx2d.fill();
-
-      // 2) 泡体：左上偏亮、右下偏深。外轮廓要有一圈色，但只能**很薄的一圈**：
-      //    圈一厚就变成"透镜/按钮"，而不是泡（真机放大后就是这个观感）。
-      const body = ctx2d.createRadialGradient(lx, ly, r * 0.04, b.x, b.y, r * 1.03);
-      body.addColorStop(0.00, hexToRgba(litC, 0.30 * alpha));
-      body.addColorStop(0.42, hexToRgba(bodyC, 0.17 * alpha));
-      body.addColorStop(0.80, hexToRgba(tierC, 0.24 * alpha));
-      body.addColorStop(0.97, hexToRgba(shadowC, 0.34 * alpha));
-      body.addColorStop(1.00, hexToRgba(shadowC, 0.10 * alpha));
-      ellipse(ctx2d, 1);
-      ctx2d.fillStyle = body;
-      ctx2d.fill();
-
-      // 3) 边缘光带：更薄、更淡的一圈浅色渐变（原来 0.93R/0.38 偏重，会形成双环）。
-      const rim = ctx2d.createRadialGradient(b.x, b.y, r * 0.74, b.x, b.y, r * 1.0);
-      rim.addColorStop(0.00, hexToRgba(litC, 0));
-      rim.addColorStop(0.80, hexToRgba(litC, 0.03 * alpha));
-      rim.addColorStop(0.95, hexToRgba(litC, 0.20 * alpha));
-      rim.addColorStop(1.00, hexToRgba(litC, 0.03 * alpha));
-      ellipse(ctx2d, 1);
-      ctx2d.fillStyle = rim;
-      ctx2d.fill();
-
-      // 4) 被照亮那一侧的轮廓光：偏左上的一段弧，是玻璃感的主要来源。
-      ctx2d.beginPath();
-      ctx2d.ellipse(b.x, b.y, r * 0.955 * scalePerp, r * 0.955 * scaleAlong, theta, 0, Math.PI * 2);
-      ctx2d.lineWidth = Math.max(1.1, r * 0.030);
-      ctx2d.lineCap = 'round';
-      const arcA = Math.atan2(ldy, ldx);
-      const arc = Math.PI * 1.05;
-      const rimLight = ctx2d.createLinearGradient(
-        b.x + Math.cos(arcA) * r, b.y + Math.sin(arcA) * r,
-        b.x - Math.cos(arcA) * r, b.y - Math.sin(arcA) * r,
-      );
-      rimLight.addColorStop(0, `rgba(255,255,255,${(st.done ? 0.20 : 0.56) * alpha})`);
-      rimLight.addColorStop(0.55, `rgba(255,255,255,${(st.done ? 0.08 : 0.22) * alpha})`);
-      rimLight.addColorStop(1, 'rgba(255,255,255,0)');
-      ctx2d.strokeStyle = rimLight;
-      ctx2d.stroke();
-      // 背光侧压一道浅暗边，泡泡才有体积（不然看着像贴纸）。
-      // 弧必须画得够长、两端必须淡到 0，否则它和受光弧的接缝会露出来一条"鬼影"斜线。
-      const arcBack = Math.PI * 0.62;
-      const shadowArc = ctx2d.createLinearGradient(
-        b.x + Math.cos(arcA + Math.PI) * r, b.y + Math.sin(arcA + Math.PI) * r,
-        b.x - Math.cos(arcA + Math.PI) * r, b.y - Math.sin(arcA + Math.PI) * r,
-      );
-      shadowArc.addColorStop(0.00, 'rgba(11,18,32,0)');
-      shadowArc.addColorStop(0.16, `rgba(11,18,32,${0.20 * alpha})`);
-      shadowArc.addColorStop(0.46, 'rgba(11,18,32,0)');
-      shadowArc.addColorStop(1.00, 'rgba(11,18,32,0)');
-      ctx2d.strokeStyle = shadowArc;
-      ctx2d.beginPath();
-      ctx2d.ellipse(b.x, b.y, r * 0.90 * scalePerp, r * 0.90 * scaleAlong, theta,
-        arcA + Math.PI - arcBack, arcA + Math.PI + arcBack);
-      ctx2d.stroke();
-      ctx2d.lineCap = 'butt';
-
-      // 5) 高光：真气泡上的反射**没有边界**。
-      //    v2 用"压扁的圆"画，被拉长的那个圆其边缘曲率跟着变形，看起来就是一片
-      //    贴在泡上的椭圆色块（真机上一眼假）。这里改成**纯粹由渐变构成的亮度场**：
-      //    只有圆心和径向衰减，没有"块的轮廓"。
-      //    位置也必须挪到 **0.74R 的贴边处**：文字的排版块会占到 ±0.36R，
-      //    高光放在泡中央会正好压在字上（真机实测就是这个问题）。
-      const gx = b.x - r * 0.523;
-      const gy = b.y - r * 0.523;
-
-      const glint = ctx2d.createRadialGradient(gx, gy, 0, gx, gy, r * 0.34);
-      glint.addColorStop(0.00, `rgba(255,255,255,${(st.done ? 0.05 : 0.16) * alpha})`);
-      glint.addColorStop(0.45, `rgba(255,255,255,${(st.done ? 0.02 : 0.07) * alpha})`);
-      glint.addColorStop(1.00, 'rgba(255,255,255,0)');
-      ctx2d.beginPath();
-      ctx2d.arc(gx, gy, r * 0.34, 0, Math.PI * 2);
-      ctx2d.fillStyle = glint;
-      ctx2d.fill();
-
-      const spark = ctx2d.createRadialGradient(gx, gy, 0, gx, gy, r * 0.07);
-      spark.addColorStop(0.00, `rgba(255,255,255,${(st.done ? 0.12 : 0.26) * alpha})`);
-      spark.addColorStop(0.50, `rgba(255,255,255,${(st.done ? 0.04 : 0.09) * alpha})`);
-      spark.addColorStop(1.00, 'rgba(255,255,255,0)');
-      ctx2d.beginPath();
-      ctx2d.arc(gx, gy, r * 0.07, 0, Math.PI * 2);
-      ctx2d.fillStyle = spark;
-      ctx2d.fill();
-
-      // 5b) 非常淡的中央亮场：不是为了"高光"，是为了让泡体有个球心，
-      //     否则去掉那团假高光之后泡面会显得平。半径大、峰值低，所以看不出形状。
-      const centerGlow = ctx2d.createRadialGradient(
-        b.x - r * 0.10, b.y - r * 0.12, 0,
-        b.x - r * 0.10, b.y - r * 0.12, r * 0.9,
-      );
-      centerGlow.addColorStop(0.00, `rgba(255,255,255,${(st.done ? 0.03 : 0.10) * alpha})`);
-      centerGlow.addColorStop(0.55, `rgba(255,255,255,${(st.done ? 0.01 : 0.04) * alpha})`);
-      centerGlow.addColorStop(1.00, 'rgba(255,255,255,0)');
-      ellipse(ctx2d, 1);
-      ctx2d.fillStyle = centerGlow;
-      ctx2d.fill();
-
-      // 6) 底部内暗影：圆的下缘积一点暗，立体感立刻出来（暗得太重会变"按钮"）
-      ctx2d.save();
-      ellipse(ctx2d, 1);
-      ctx2d.clip();
-      const inner = ctx2d.createRadialGradient(
-        b.x + r * 0.18, b.y + r * 0.30, r * 0.30,
-        b.x, b.y, r * 1.08,
-      );
-      inner.addColorStop(0.58, 'rgba(11,18,32,0)');
-      inner.addColorStop(0.86, `rgba(11,18,32,${0.08 * alpha})`);
-      inner.addColorStop(1.00, `rgba(11,18,32,${0.17 * alpha})`);
-      ctx2d.fillStyle = inner;
-      ctx2d.fillRect(b.x - r * 1.2, b.y - r * 1.2, r * 2.4, r * 2.4);
-      ctx2d.restore();
-
-      // 7) 选中态：外面加一圈深色描边（比白色更清楚）
-      if (isSelected) {
-        ellipse(ctx2d, 1);
-        ctx2d.lineWidth = 2.5 + Math.abs(s) * 8;
-        ctx2d.strokeStyle = luminance(tierC) > 0.45 ? 'rgba(20,26,40,.75)' : 'rgba(255,255,255,.9)';
-        ctx2d.stroke();
-      } else {
-        // 常规外描边：一条极细的深色边，把泡泡从背景里"切"出来
-        ellipse(ctx2d, 1);
-        ctx2d.lineWidth = Math.max(0.8, r * 0.018);
-        ctx2d.strokeStyle = overdue
-          ? hexToRgba(OVERDUE_EDGE, 0.55 * alpha)
-          : `rgba(15,23,42,${0.14 * alpha})`;
-        ctx2d.stroke();
-      }
-
-      // 7b) 长按进度环：按住 2.5 秒就戳破，环走满即触发
-      if (b.hold > 0.001) {
-        ctx2d.beginPath();
-        ctx2d.arc(b.x, b.y, r * LONG_PRESS_RING, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * b.hold);
-        ctx2d.lineWidth = Math.max(2.5, r * 0.09);
-        ctx2d.lineCap = 'round';
-        ctx2d.strokeStyle = `rgba(239,68,68,${0.55 + 0.35 * b.hold})`;
-        ctx2d.stroke();
-        ctx2d.lineCap = 'butt';
-      }
-
-      // 7a) 「容器过期」标记：一圈暗紫**虚线**环。
-      //
-      // 为什么要单独一种画法：这颗泡泡自己没到期（文字写的是"剩余 N 天"），
-      // 只是它所在的容器过期了。整颗变紫会让文字和颜色互相矛盾（用户报的 bug）。
-      // 虚线环表达"有约束加在你身上，但你自己还没到期"——和实心紫（自己过期）区分得开。
-      if (inheritedOverdue) {
-        ctx2d.save();
-        ctx2d.beginPath();
-        ctx2d.arc(b.x, b.y, r * 1.03, 0, Math.PI * 2);
-        ctx2d.setLineDash([Math.max(3, r * 0.16), Math.max(3, r * 0.13)]);
-        ctx2d.lineWidth = Math.max(2, r * 0.055);
-        ctx2d.strokeStyle = hexToRgba(OVERDUE_COLOR, 0.85 * alpha);
-        ctx2d.stroke();
-        ctx2d.restore();
-      }
-
-      if (r >= 18) {
-        const textColor = tierTextColor(st.tierKey);
-        // 暗色字 → 浅色底衬；亮色字 → 深色底衬。底衬**必须和圆的形状一致**：
-        // v2 用的是一块矩形渐变，真机放大后能清楚看到方形边缘戳在圆里，非常假。
-        const darkText = luminance(textColor) < 0.5;
-        ctx2d.textAlign = 'center';
-        ctx2d.textBaseline = 'middle';
-        const titleSize = Math.max(10, Math.min(19, r * 0.30));
-        // 长英文/编号宁可把字号缩一点，也别把词劈成两行（"CHILD-AM" / "BER"）
-        const fitted = wrapTextToFit(ctx2d, b.item.event.title, r * 1.58, titleSize, r > 52 ? 3 : 2);
-        const lines = fitted.lines;
-        const fittedSize = fitted.fontSize;
-        ctx2d.font = `650 ${fittedSize}px system-ui, "Segoe UI", sans-serif`;
-        const lineH = fittedSize + 3;
-        const blockH = lines.length * lineH;
-        const showSub = r >= 34;
-        const showLevel = r >= 56;
-        // 倒数文字不能跟着半径缩到看不见：最小 10px，并且**和标题同色**
-        // （原来固定写白色 0.94，浅色泡体上几乎看不出）
-        const subSize = Math.max(10, Math.min(13, titleSize * 0.74));
-        const gap = 3;
-        const subBlock = showSub ? subSize : 0;
-        const totalH = blockH + (showSub ? gap + subBlock : 0);
-        // 有档位标签时整体下移一点，给上面那行让位
-        const centerY = b.y + (showLevel ? r * 0.06 : 0);
-        const textTop = centerY - totalH / 2;
-        const textBottom = textTop + totalH;
-
-        if (!darkText) {
-          // 亮色字：一层圆形的径向暗晕垫在文字后面（没有边，不会露出方块）
-          const plateR = Math.max(blockH * 0.95, (textBottom - textTop) * 0.8);
-          const plateCY = (textTop + textBottom) / 2;
-          const plate = ctx2d.createRadialGradient(b.x, plateCY, 0, b.x, plateCY, plateR);
-          plate.addColorStop(0.00, `rgba(9,14,26,${0.30 * alpha})`);
-          plate.addColorStop(0.62, `rgba(9,14,26,${0.16 * alpha})`);
-          plate.addColorStop(1.00, 'rgba(9,14,26,0)');
-          ctx2d.beginPath();
-          ctx2d.arc(b.x, plateCY, plateR, 0, Math.PI * 2);
-          ctx2d.fillStyle = plate;
-          ctx2d.fill();
-        }
-
-        ctx2d.save();
-        ctx2d.lineJoin = 'round';
-        ctx2d.lineWidth = Math.max(2, titleSize * (darkText ? 0.26 : 0.24));
-        ctx2d.strokeStyle = darkText
-          ? `rgba(255,255,255,${0.42 * alpha})`
-          : `rgba(9,14,26,${0.32 * alpha})`;
-        ctx2d.fillStyle = textColor;
-        let y = textTop;
-        for (const line of lines) {
-          ctx2d.strokeText(line, b.x, y + titleSize / 2);
-          ctx2d.fillText(line, b.x, y + titleSize / 2);
-          y += lineH;
-        }
-
-        if (showSub) {
-          ctx2d.font = `650 ${subSize}px system-ui, "Segoe UI", sans-serif`;
-          ctx2d.lineWidth = Math.max(2, subSize * 0.26);
-          // 第一行是"还剩多久"（v0.4 的主角），时间点跟在后面。
-          // ⚠️ 重复事件的实例还要带**周几** —— 一周勾了 7 天时，
-          //    7 个泡泡标题一样、时间数字也可能一样，只有周几能区分是哪一个。
-          //    （用户报："我选了 7 个泡泡你不能都显示剩一个时间吧，要有周几的区别"）
-          const sub = st.weekdayLabel
-            ? `${st.countdownText} · 周${st.weekdayLabel} ${hhmm(b.item.start)}`
-            : `${st.countdownText} · ${hhmm(b.item.start)}`;
-          const subY = textTop + blockH + gap + subSize / 2;
-          ctx2d.strokeText(sub, b.x, subY);
-          ctx2d.fillStyle = textColor;
-          ctx2d.globalAlpha = 0.95;
-          ctx2d.fillText(sub, b.x, subY);
-          ctx2d.globalAlpha = 1;
-        }
-        if (showLevel) {
-          ctx2d.font = `700 ${Math.max(9, titleSize * 0.62)}px system-ui, sans-serif`;
-          ctx2d.lineWidth = Math.max(2, titleSize * 0.2);
-          const tag = `● ${(st.level && st.level.label) || ''}`;
-          const tagY = b.y - r * 0.62;
-          ctx2d.strokeText(tag, b.x, tagY);
-          ctx2d.fillStyle = hexToRgba('#ffffff', 0.92 * alpha);
-          ctx2d.fillText(tag, b.x, tagY);
-        }
-        ctx2d.restore();
+        // ---- 第二步：画 ----
+        paintBubble(b, calc.values, calc.lines);
+      } catch (err) {
+        // 画挂了：报出现场 + **补一颗圆**（"看得见"比"少一颗"强得多），然后继续下一颗
+        reportBubbleFailure(b, 'draw', [], err);
+        drawSafeBubble(b, alphaOfStyle(b.item && b.item.style));
       }
     }
   }
@@ -1614,6 +1908,16 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
       ownOverdue: !!(b.item && b.item.style && b.item.style.ownOverdue),
       overdueInherited: !!(b.item && b.item.style && b.item.style.overdueInherited),
     }));
+    /**
+     * 把**这次参与绘制的 item 数组**也暴露出去，只给自动化测试用。
+     *
+     * ⚠️ 为什么必须是 item（而不是 bodies）：`draw()` 每帧都现读 `b.item.style`，
+     *    所以测试只要往这里塞一个坏字段（例如 `style.level = 'red'` 字符串、
+     *    `style.radiusRatio = NaN`），**下一帧的绘制就会用上它** ——
+     *    这正是"注入一颗坏泡泡，看其余泡泡还在不在"这条验收断言需要的入口。
+     *    （第一版想用"篡改 bodies 里闭包对象"的办法，从测试侧根本够不到。）
+     */
+    window.__bubbleItems = () => items;
     window.__bubbleCanvasSize = () => ({ width, height });
     // 手动触发一次重算（测试用；生产代码里由帧循环每 RESTYLE_MS 调一次）
     window.__bubbleRestyle = () => { restyleAll(); return true; };
@@ -2110,10 +2414,127 @@ function startSimulation({ canvas, items, config, ctx, local, events = [] }) {  
  * 形状：以泡壁为底、向圆心方向收成一个尖，所以看起来是"从壁里扎进来"。
  * 刺用暗紫渐变，越靠尖越深，和变紫的泡体是一个色系。
  */
-function drawOverdueSpikes(ctx2d, b, r, theta) {
+// ---------- 节日泡泡的背景图案 ----------
+//
+// 图案本体（月亮/灯笼/粽子/雪花…）在 `core/festival-art.js` 里，是一串**形状清单**；
+// 这里只负责按泡泡半径缩放、裁成圆形、压低透明度画上去。
+//
+// 为什么要压透明度：这些图案是**背景**，泡泡上还有标题、倒计时、剩余天数三行字。
+// 图案一浓，文字就读不清了（用户最在意的是"还剩几天"能不能一眼看到）。
+// 所以：图案整体只有 ~40% 的存在感，而且永远画在文字下面。
+const FESTIVAL_ART_ALPHA = 0.42;
+/** 图案画挂了只报一次（每帧都报会把控制台刷爆，反而找不到别的问题） */
+let artDrawWarned = false;
+
+/** 用户自己那张图的解码缓存（data URL → Image）。解码是异步的，先画别的，加载好下一帧自然就出现。 */
+const artImageCache = new Map();
+
+function artImageFor(src) {
+  if (artImageCache.has(src)) return artImageCache.get(src);
+  const img = new Image();
+  // ⚠️ 只认 data:（自己在设置里压好的图）。外链图片在离线/平板上会变白框，不许用。
+  img.src = src;
+  artImageCache.set(src, img);
+  return img;
+}
+
+/**
+ * 画节日图案。坐标是 **100×100 的方框**，映射到泡泡内切圆的 ~86%。
+ * @param {CanvasRenderingContext2D} ctx2d
+ * @param {{x:number,y:number}} b 泡泡中心
+ * @param {number} r 泡泡半径
+ * @param {string} key 节日 key
+ * @param {object} customArt `settings.festivalArt`
+ * @param {number} alpha 泡泡整体的透明度（done/dimmed 的泡泡图案也要跟着淡）
+ */
+function drawFestivalArt(ctx2d, b, r, key, customArt, alpha) {
+  const art = festivalArt(key, { customArt });
+  const s = ((r * 2) / 100) * 0.86;
+  const x0 = b.x - 50 * s;
+  const y0 = b.y - 50 * s;
+
+  ctx2d.save();
+  // 裁成圆形：图案绝不允许溢出泡泡（溢出就成了"贴纸跑了"，一眼难看）
+  ctx2d.beginPath();
+  ctx2d.arc(b.x, b.y, r * 0.985, 0, Math.PI * 2);
+  ctx2d.clip();
+  ctx2d.globalAlpha = FESTIVAL_ART_ALPHA * alpha;
+
+  if (art.image) {
+    const img = artImageFor(art.image);
+    if (img && img.complete && img.naturalWidth) {
+      // 自定义图片：按"填满圆形"（cover）画，不然一张竖图会被拉扁
+      const side = r * 2;
+      const ratio = Math.max(side / img.naturalWidth, side / img.naturalHeight);
+      const w = img.naturalWidth * ratio;
+      const h = img.naturalHeight * ratio;
+      ctx2d.drawImage(img, b.x - w / 2, b.y - h / 2, w, h);
+    }
+  } else {
+    for (const sh of art.shapes) {
+      ctx2d.globalAlpha = FESTIVAL_ART_ALPHA * alpha * (sh.a === undefined ? 1 : sh.a);
+      ctx2d.fillStyle = sh.color;
+      if (sh.t === 'c') {
+        ctx2d.beginPath();
+        ctx2d.arc(x0 + sh.x * s, y0 + sh.y * s, Math.max(0.5, sh.r * s), 0, Math.PI * 2);
+        ctx2d.fill();
+      } else if (sh.t === 'e') {
+        ctx2d.beginPath();
+        ctx2d.ellipse(x0 + sh.x * s, y0 + sh.y * s, Math.max(0.5, sh.rx * s), Math.max(0.5, sh.ry * s),
+          ((sh.rot || 0) * Math.PI) / 180, 0, Math.PI * 2);
+        ctx2d.fill();
+      } else if (sh.t === 'l' && sh.pts && sh.pts.length >= 2) {
+        // 折线（描边）：灯笼的金带、柳枝、雪花的轴都是它。圆头，不然一根根都像针。
+        ctx2d.strokeStyle = sh.color;
+        ctx2d.lineWidth = Math.max(0.6, (sh.w || 3.6) * s);
+        ctx2d.lineCap = 'round';
+        ctx2d.lineJoin = 'round';
+        ctx2d.beginPath();
+        ctx2d.moveTo(x0 + sh.pts[0][0] * s, y0 + sh.pts[0][1] * s);
+        for (let i = 1; i < sh.pts.length; i += 1) ctx2d.lineTo(x0 + sh.pts[i][0] * s, y0 + sh.pts[i][1] * s);
+        ctx2d.stroke();
+      } else if (sh.t === 'p' && sh.pts && sh.pts.length) {
+        ctx2d.beginPath();
+        ctx2d.moveTo(x0 + sh.pts[0][0] * s, y0 + sh.pts[0][1] * s);
+        for (let i = 1; i < sh.pts.length; i += 1) ctx2d.lineTo(x0 + sh.pts[i][0] * s, y0 + sh.pts[i][1] * s);
+        ctx2d.closePath();
+        ctx2d.fill();
+      }
+    }
+  }
+  ctx2d.restore();
+}
+
+/**
+ * 泡泡轮廓（含形变）的公共路径 —— **绘制里所有椭圆都走这一条**。
+ *
+ * 为什么抽出来：以前这句 `ctx.ellipse(b.x + shakeX, b.y, r*scalePerp*scale, ...)`
+ * 在绘制代码里重复了 6 次，每处都自带一次"位置 + 半径 + 形变"的乘法。
+ * 那种重复正是"某一处漏了兜底就整帧炸"的温床；现在坐标全部来自 `drawNumbersOf`
+ * （core 里逐字段兜过底），这里只做一次乘。
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {object} v `drawNumbersOf` 的 values
+ * @param {number} scale 额外的缩放（正常都是 1）
+ */
+function ellipsePath(ctx, v, scale) {
+  ctx.beginPath();
+  ctx.ellipse(
+    v.drawX, v.y,
+    v.r * v.scalePerp * scale, v.r * v.scaleAlong * scale,
+    v.theta, 0, Math.PI * 2,
+  );
+}
+
+function drawOverdueSpikes(ctx2d, b, v) {
   const n = OVERDUE_SPIKES;
-  const inner = r * (1 - OVERDUE_SPIKE_LEN);
-  const spike = ctx2d.createRadialGradient(b.x, b.y, inner, b.x, b.y, r);
+  const r = v.r;
+  const theta = v.theta;
+  // ⚠️ 半径/内圈半径全部来自 drawNumbersOf（它在 core 里被 tools/bubble-finite.test.mjs
+  //    逐字段钉住"必须是有限数"）。这里再就地算一次 `r * (1 - LEN)` 就等于又开了一个
+  //    "一个字段坏了就整帧抛非有限"的口子 —— 这次事故的教训就是别再这么写。
+  const inner = v.spikeInnerR;
+  const spike = ctx2d.createRadialGradient(v.x, v.y, inner, v.x, v.y, v.spikeOuterR);
   spike.addColorStop(0, hexToRgba(OVERDUE_EDGE, 0.05));
   spike.addColorStop(0.55, hexToRgba(OVERDUE_COLOR, 0.55));
   spike.addColorStop(1, hexToRgba(OVERDUE_EDGE, 0.95));
@@ -2122,11 +2543,11 @@ function drawOverdueSpikes(ctx2d, b, r, theta) {
   for (let i = 0; i < n; i += 1) {
     // 让刺跟着气泡的形变一起拉长/压扁（角度与泡体一致）
     const a = theta + (i / n) * Math.PI * 2;
-    const halfW = Math.max(1.2, r * 0.055);
-    const tipX = b.x + Math.cos(a) * inner;
-    const tipY = b.y + Math.sin(a) * inner;
-    const baseX = b.x + Math.cos(a) * r;
-    const baseY = b.y + Math.sin(a) * r;
+    const halfW = v.spikeHalfW;
+    const tipX = v.x + Math.cos(a) * inner;
+    const tipY = v.y + Math.sin(a) * inner;
+    const baseX = v.x + Math.cos(a) * r;
+    const baseY = v.y + Math.sin(a) * r;
     const px = -Math.sin(a) * halfW;
     const py = Math.cos(a) * halfW;
 

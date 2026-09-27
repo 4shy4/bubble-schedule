@@ -26,6 +26,8 @@ import { deadlineFromParts as deadlineFromDistance } from './countdown.js';
 import { mondayOf } from './time.js';
 // 墓碑是同步（4c）能区分"删除"和"没有"的唯一依据 —— 删除路径必须记它
 import { markDeleted, clearTombstone, categoryOfEvent } from './sync.js';
+// 「本地活动日记」：完成/改期/戳破/逾期在这里各记一行（开关默认关，见那边文件头）
+import { logActivity } from './activity-log.js';
 
 const LEVEL_KEYS = new Set(LEVELS.map((l) => l.key));
 
@@ -292,6 +294,15 @@ export function popEvent(db, eventId, opts = {}, now) {
   const occurrence = opts.occurrence ? new Date(opts.occurrence) : null;
   const remainingMs = Number.isFinite(Number(opts.remainingMs)) ? Number(opts.remainingMs) : null;
 
+  // 「本地活动日记」（第 52 轮）：戳破是用户最想回看"我做过什么"的那个动作，记一条。
+  // ⚠️ 只记 id / 标题 / 等级 / 剩余时间 —— 备注、好友关键词**不在**字段白名单里
+  //    （见 core/activity-log.js 的 FIELD_WHITELIST），传进来也会被丢掉。
+  // ⚠️ 记录总闸默认关（`settings.activitySettings.enabled`）：关着时这一行什么都不做，
+  //    也不会凭空造出 `activityLog` 这个键。
+  logActivity(db.settings, 'event', 'popped', {
+    refId: e.id, title: e.title, level: levelOf(e), remainingMs,
+  }, at);
+
   if (occurrence && isRecurring(e)) {
     // 重复事件：只记这一颗
     if (!e.popped || typeof e.popped !== 'object') e.popped = {};
@@ -426,6 +437,70 @@ export function updateSettings(db, patch) {
   //    而且它是**两端共用**的一份显示设置（网页 + Windows 桌面气泡层），
   //    所以更要按字段合并 —— 被冲掉的症状是"桌面上突然多/少了几颗"，很难联想到设置合并。
   if (patch.bubbleView) next.bubbleView = { ...(prev.bubbleView || {}), ...patch.bubbleView };
+  // ⚠️ `ai` 是第三个要**逐字段合并**的嵌套对象（还是上面那条 notify 的坑）：
+  //    设置页改"模型名"时 patch 里只有 `{ai:{model}}`，整体替换会把 `apiKey` 抹掉 ——
+  //    症状是"我就换了个模型，怎么又提示没配置 AI 了"，而用户绝不会怀疑到合并上。
+  //    注意：这里只做"别把没动的字段冲掉"，不打印、不回显这个对象（里面有 key）。
+  if (patch.ai) next.ai = { ...(prev.ai || {}), ...patch.ai };
+  // ⚠️ `greetingSettings` / `greetingProfile` 是第四、第五个要**逐字段合并**的嵌套对象
+  //    （还是上面那条 notify 的坑，这里换成了祝福设置）：
+  //      · 改"当天几点发"时 patch 里只有 `{greetingSettings:{atHour:9}}`，
+  //        整体替换会把 `leadDays`（提前几天）冲回默认 0 ——
+  //        症状是"我明明设了提前 3 天，就改了个时间怎么就没了"，
+  //        而这两项是**一起用**的（提前准备 + 当天提醒），谁也离不开谁。
+  //      · `greetingSettings` 里还住着 `sentLog`（已发账本，防重发）和 `drafts`
+  //        （祝福草稿/发送状态）。它们**按整份提交**（发送状态是本页的真相源），
+  //        所以这里的浅合并正是想要的粒度：**上面的字段保住，下面的子对象整份替换**。
+  //      · `greetingProfile`（我是谁 / 我的全局关键词）同理：只改语气不该把关键词抹掉。
+  //    ⚠️ 只**增**不删、也不重排：上面 `notify` / `bubbleView` / `ai` 三行一个字都没动
+  //       （另一个工位刚加的 `ai` 就在上一行，别把人家弄丢）。
+  if (patch.greetingSettings) {
+    next.greetingSettings = { ...(prev.greetingSettings || {}), ...patch.greetingSettings };
+  }
+  if (patch.greetingProfile) {
+    next.greetingProfile = { ...(prev.greetingProfile || {}), ...patch.greetingProfile };
+  }
+  // ⚠️ `aiFeatures` 是第六个要**逐字段合并**的嵌套对象（还是上面那条 notify 的坑，
+  //    这次是 AI 助手那一组开关）：
+  //      · 用户在设置页逐个开关（今日简报 / 周复盘 / 把日程喂给 AI），
+  //        界面**按整份**提交是常态，但同步、旧版界面、以后可能加的单开关按钮
+  //        都会只提交其中一个键 —— 整体替换会把另外两个开关冲回缺省，
+  //        症状是"我只打开了周复盘，今日简报怎么被关了"（用户会以为开关坏了）。
+  //      · 另一条更重要的理由：**关掉必须是真关掉**。整份替换时若客户端漏传了
+  //        某个键，用户以为关掉的功能会"自己又开了" —— 这类功能的默认关是
+  //        用户的明确要求，不能因为一次合并把它弄回开。
+  //    ⚠️ 只**增**不删、也不重排：上面 `notify` / `bubbleView` / `ai` /
+  //       `greetingSettings` / `greetingProfile` 几行一个字都没动（别把人家弄丢）。
+  if (patch.aiFeatures) {
+    next.aiFeatures = { ...(prev.aiFeatures || {}), ...patch.aiFeatures };
+  }
+  // ⚠️ `aiShare` 是第七个要**逐字段合并**的嵌套对象（还是上面那条 notify 的坑，
+  //    这次是"把电脑当平板的 AI 服务器"那组设置）：
+  //      · 用户点「重新生成令牌」时 patch 里只有 `{aiShare:{token:新值}}`，
+  //        整体替换会把 `enabled` 冲回默认 false —— 症状是"我点了换令牌，
+  //        共享怎么自己关了"，而平板那边只会表现为"连不上"。
+  //      · 反过来，开/关共享时 patch 里只有 `{aiShare:{enabled:true}}`，
+  //        整体替换会把 `token` 抹掉 —— 平板手里那个令牌**当场失效**，
+  //        而用户完全不会把这件事和"我刚点了一下开关"联系起来。
+  //      · `port` 同理：它和地址是配套的，谁也离不开谁。
+  //    ⚠️ 只**增**不删、也不重排：上面几行一个字都没动（别把人家弄丢）。
+  if (patch.aiShare) {
+    next.aiShare = { ...(prev.aiShare || {}), ...patch.aiShare };
+  }
+  // ⚠️ `activitySettings` 是第八个要**逐字段合并**的嵌套对象（还是上面那条 notify 的坑，
+  //    这次是"本地活动日记"的保留策略 + 记录总闸）：
+  //      · 界面改"最多留几条"时 patch 里只有 `{activitySettings:{maxEntries:200}}`，
+  //        整体替换会把 `enabled`（记录总闸）冲回缺省 false —— 症状是
+  //        "我只改了个条数，记录怎么自己停了"，而用户绝不会怀疑到合并上。
+  //      · 反过来开记录时 patch 里只有 `{activitySettings:{enabled:true}}`，
+  //        整体替换会把用户设过的 `maxDays` 冲掉。
+  //    ⚠️ `activityLog`（那个数组）**故意不做逐字段合并**：它是**整份**账本，
+  //       追加/裁剪都在 core/activity-log.js 里算好新数组再整份提交（像 `sentLog` 那样）。
+  //       在这里做"按字段合并数组"没有意义（数组的合并语义不清，见 core/defaults.js 的规则）。
+  //    ⚠️ 只**增**不删、也不重排：上面几行一个字都没动（别把人家弄丢）。
+  if (patch.activitySettings) {
+    next.activitySettings = { ...(prev.activitySettings || {}), ...patch.activitySettings };
+  }
   db.settings = next;
   return db.settings;
 }
@@ -568,6 +643,7 @@ export function upsertEvent(db, input, now) {
   };
 
   const idx = db.events.findIndex((e) => e.id === base.id);
+  const prev = idx >= 0 ? db.events[idx] : null;
   if (idx >= 0) {
     // 改完之后可能违反层级（例如把自己的颜色调大、超过了父容器）→ 再校验一遍
     if (base.parentId) {
@@ -576,9 +652,19 @@ export function upsertEvent(db, input, now) {
         throw Object.assign(new Error('改完之后颜色比父气泡还大了，父气泡里放不下'), { status: 400 });
       }
     }
-    db.events[idx] = { ...db.events[idx], ...base, createdAt: db.events[idx].createdAt };
+    db.events[idx] = { ...prev, ...base, createdAt: prev.createdAt };
+    // 「本地活动日记」：**只有时间真的被改过**才记"改期"。只改标题/颜色/备注也叫
+    // "编辑"，记成"改期"就是编数据（摘要里那句"改期 N 次"会变成假账）。
+    if (String(prev.start) !== String(base.start) || String(prev.deadline) !== String(base.deadline)) {
+      logActivity(db.settings, 'event', 'rescheduled', {
+        refId: base.id, title: base.title, level: base.level, from: prev.start, to: base.start,
+      }, at);
+    }
   } else {
     db.events.push(base);
+    logActivity(db.settings, 'event', 'created', {
+      refId: base.id, title: base.title, type: base.type, level: base.level,
+    }, at);
   }
   // 复活：这个 id 之前被删过（有墓碑），现在又被创建/更新了 → 把墓碑撤掉。
   // 不撤的话，同步时对方会按旧墓碑把它又删一次（"新建的日程一同步就没了"）。
@@ -646,7 +732,33 @@ export function patchEvent(db, eventId, patch, now) {
     }
   }
 
-  Object.assign(e, patch, { id: e.id, updatedAt: isoNow(now) });
+  const at = isoNow(now);
+  const nowD = (now instanceof Date && Number.isFinite(now.getTime())) ? now : new Date(at);
+  const beforeStart = e.start;
+  const beforeDeadline = e.deadline;
+  Object.assign(e, patch, { id: e.id, updatedAt: at });
+
+  // 「本地活动日记」（第 52 轮）：两个只有在这里才看得见的动作。
+  //   · `done:true` —— "完成"。切换完成走的就是这条 patch
+  //     （web/adapter/store.js 的 toggleDone → patchEvent）。
+  //   · 起始/到期时间被改 —— "改期"。
+  // ⚠️ 判据是"值真的变了"（和旧值比），不是"patch 里有没有这个键"：
+  //    编辑器保存时经常把没改过的时间原样再发一遍，按"有键"记会让摘要里的
+  //    "改期 N 次"虚高成假账。反之，`done:false`（取消完成）**不记** ——
+  //    统计里没有"反悔"这一项，硬塞进"完成"就是编数据。
+  if (patch.done === true) {
+    logActivity(db.settings, 'event', 'done', {
+      refId: e.id, title: e.title, level: levelOf(e),
+      remainingMs: remainingMsOf(e, nowD),
+    }, at);
+  } else if (
+    (patch.start !== undefined && String(patch.start) !== String(beforeStart))
+    || (patch.deadline !== undefined && String(patch.deadline) !== String(beforeDeadline))
+  ) {
+    logActivity(db.settings, 'event', 'rescheduled', {
+      refId: e.id, title: e.title, level: levelOf(e), from: beforeStart, to: e.start,
+    }, at);
+  }
   return e;
 }
 
