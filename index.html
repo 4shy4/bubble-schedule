@@ -19,6 +19,11 @@
 <link rel="stylesheet" href="web/css/views.css" />
 <link rel="stylesheet" href="web/css/components.css" />
 <link rel="stylesheet" href="web/demo.css" />
+<script>
+  // 微信内置浏览器：它**会拦掉 .apk 下载**，所以先把话说明白（见下面 demo-bar / demo-hint 里的 wx-only 片段）。
+  // 只往 <html> 上加一个 class，不联网、无依赖；老内核里 UA 读不到就走 catch，不影响任何别的功能。
+  try { if (/MicroMessenger/i.test(navigator.userAgent)) document.documentElement.className += ' wechat'; } catch (e) {}
+</script>
 </head>
 <body>
 <!--
@@ -45,6 +50,9 @@
   <b id="view-title">气泡面板</b>
   <span id="view-subtitle" class="demo-sub"></span>
   <span class="demo-nav" id="view-nav"></span>
+  <!-- 去下载页。这是个**网页**（不是微信小程序），所以在页面上给出下载入口没有任何规则问题；
+       而且入口做得克制一点：一行小字，不抢气泡的视觉。 -->
+  <a class="demo-install" href="install.html">下载到手机</a>
 </div>
 
 <div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="false"></div>
@@ -57,7 +65,57 @@
   <b>长按 2.5 秒</b> = 戳破 ·
   单击空白 = 新建 ·
   右下角 <b>?</b> 展开说明
+  <!-- ⚠️ 微信里这一条才显示：微信会拦 .apk 下载，"点这里下载"在微信里是死路，
+       必须先告诉人去「在浏览器打开」。 -->
+  <span class="wx-only">
+    · 想装到手机上：点右上角 <b>⋯</b> → <b>在浏览器打开</b>，再打开 <a href="install.html">下载页</a>
+  </span>
 </div>
+
+<!--
+  ⚠️⚠️ 载入失败的兜底 —— 这个块比它看起来重要。
+
+  这个页面全靠一行 `<script type="module" src="web/demo.js">`。而下面两种情况
+  **都是白屏**，用户在页面上看不到任何线索：
+    ① 内核不支持 ES module（老 X5 / Android 微信内置浏览器 / 很老的 Safari）；
+    ② 内核支持，但模块加载或执行失败（相对路径少了层、网络被截断、某个 import 抛错）。
+  情况 ① 用 `nomodule` 接（那个脚本在支持 module 的内核里**根本不会执行**）；
+  情况 ② 用看门狗接。
+
+  为什么用"标志位 + 超时"而不是 try/catch 包住 import：
+    module 的解析/执行发生在**另一个脚本上下文**里，这里的 catch 抓不到它的错。
+    唯一可靠的判据是"渲染完成后自己举一下手"（web/demo.js 末尾写 __bubbleBooted）。
+  为什么 6 秒：慢网下真正加载完大约 1 秒内；6 秒是"明显不对劲"的量级，
+    又不至于让用户等太久。宁可晚一点报，也不要误报。
+-->
+<div id="boot-error" class="boot-error">
+  <div class="boot-error-in">
+    <h1>这个浏览器没能打开这个页面</h1>
+    <p>
+      页面用的是 ES module，需要较新的浏览器。<br />
+      如果你是在<b>微信</b>里：点右上角 <b>⋯</b> → <b>在浏览器打开</b>。
+    </p>
+    <p class="boot-url mono" id="boot-url"></p>
+    <p><a class="boot-go" href="install.html">下载到手机 →</a></p>
+  </div>
+</div>
+
+<script nomodule>
+  // 只有"不支持 ES module"的内核才会执行这里 —— 正好是白屏的第 ① 种情况。
+  document.documentElement.className += ' no-module';
+</script>
+<script>
+  // 看门狗（经典脚本：不支持 module 的内核也会跑它）。
+  (function () {
+    try { document.getElementById('boot-url').textContent = location.href; } catch (e) {}
+    window.__bubbleBootTimer = setTimeout(function () {
+      if (!window.__bubbleBooted) {
+        var el = document.getElementById('boot-error');
+        if (el) el.className += ' on';
+      }
+    }, 6000);
+  })();
+</script>
 
 <script type="module" src="web/demo.js"></script>
 </body>

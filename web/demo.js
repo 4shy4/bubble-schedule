@@ -76,3 +76,10 @@ window.__demo = {
   bubbles: () => document.querySelectorAll('canvas.bubble-canvas').length,
   bodyLen: () => (document.body.innerText || '').length,
 };
+
+// ⚠️ 载入成功的标志 —— index.html 里的看门狗靠它决定要不要报"打不开"。
+//    必须放在 **render() 之后**：import 成功 ≠ 能用（画布尺寸为 0 时同样是白屏），
+//    所以"举手的时机"是"第一帧画完了"，不是"模块被加载了"。
+//    另外顺手把定时器清掉，免得白屏提示在几百毫秒后突然盖到已经画好的画面上。
+window.__bubbleBooted = true;
+if (window.__bubbleBootTimer) clearTimeout(window.__bubbleBootTimer);

@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0b1020" />
+<title>把「日程表」装到手机上 · 下载与说明</title>
+<meta name="description" content="日程表（Timetable）：本地优先的日程 / 课程表工具。安卓下载 APK，iPhone / iPad 走网页版或自己签名。数据全部存在你自己设备上。" />
+<!-- 空的 data: 图标：不写这行浏览器会去请求 /favicon.ico，多一条无意义的 404。 -->
+<link rel="icon" href="data:," />
+<!-- ⚠️ 这一行是**二维码的唯一真源**：tools/make-install-qr.mjs 会来这里读地址去生成 qr.svg，
+     而不是各自硬编码一份（两处写同一个 URL，早晚会不一致）。
+     它同时也告诉搜索引擎/分享卡片"这一页的正式地址是哪个"。 -->
+<link rel="canonical" href="https://4shy4.github.io/bubble-schedule/install.html" />
+<!--
+  为什么这个页面**自带样式**、不复用 web/css/*：
+    它是「下载页」，不是应用界面 —— 应用的样式表是给 .app 那套网格/侧栏/气泡用的，
+    在这里引进来只会互相打架。而且这一页要能在**任何浏览器**里正常显示
+    （包括不支持 ES module 的老内核），所以：单文件、无外部资源、无依赖。
+  这里也不引任何 CDN / 字体 / 统计 —— 一个"数据不出你机器"的项目，
+  下载页自己先去联网是很荒谬的。
+-->
+<style>
+  :root {
+    --bg: #0b1020;
+    --card: #151b30;
+    --card-2: #1b2340;
+    --line: #2a3350;
+    --fg: #e8ecf6;
+    --dim: #9aa6c4;
+    --brand: #5b8cff;
+    --brand-2: #3f6fe0;
+    --ok: #43c08a;
+    --warn: #f0b45a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", sans-serif;
+    padding: 0 16px 56px;
+    -webkit-text-size-adjust: 100%;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  header { padding: 40px 0 8px; }
+  h1 { font-size: 28px; line-height: 1.35; margin: 0 0 12px; letter-spacing: .5px; }
+  h2 { font-size: 19px; margin: 40px 0 12px; padding-top: 20px; border-top: 1px solid var(--line); }
+  h2:first-of-type { border-top: 0; }
+  p { margin: 0 0 12px; }
+  .lead { color: var(--dim); font-size: 15.5px; }
+  a { color: var(--brand); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
+  code { background: #0e1428; border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; font-size: 13.5px; }
+  .btns { display: grid; gap: 12px; margin: 22px 0 6px; }
+  a.btn {
+    display: block; padding: 15px 18px; border-radius: 12px;
+    background: linear-gradient(180deg, var(--brand), var(--brand-2));
+    color: #fff; text-align: center; font-size: 16.5px; font-weight: 600;
+    box-shadow: 0 6px 18px rgba(63, 111, 224, .28);
+  }
+  a.btn:hover { text-decoration: none; filter: brightness(1.06); }
+  a.btn.ghost {
+    background: var(--card); color: var(--fg); border: 1px solid var(--line);
+    font-weight: 500; box-shadow: none;
+  }
+  .under { color: var(--dim); font-size: 13.5px; margin: 8px 2px 0; }
+  .qr { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; margin: 14px 0 0; }
+  .qr .box { background: #fff; padding: 10px; border-radius: 12px; line-height: 0; }
+  .qr img { width: 168px; height: 168px; display: block; }
+  .qr .side { min-width: 200px; flex: 1; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin: 12px 0; }
+  .card h3 { margin: 0 0 8px; font-size: 16px; }
+  .card p:last-child { margin-bottom: 0; }
+  ol, ul { margin: 0 0 12px; padding-left: 22px; }
+  li { margin: 4px 0; }
+  .k { color: var(--fg); font-weight: 600; }
+  .dim { color: var(--dim); }
+  .warn { color: var(--warn); }
+  .ok { color: var(--ok); }
+  .hash { word-break: break-all; font-size: 12.5px; color: var(--dim); }
+  footer { margin-top: 44px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--dim); font-size: 13.5px; }
+  .wx { display: none; }
+  html.wechat .wx { display: block; }
+  .wx-tip {
+    background: #1d2a1f; border: 1px solid #2f5238; border-radius: 12px;
+    padding: 14px 16px; margin: 18px 0 0; font-size: 14.5px;
+  }
+  button.copy {
+    margin-top: 6px; padding: 8px 14px; border-radius: 9px; cursor: pointer;
+    background: var(--card-2); color: var(--fg); border: 1px solid var(--line); font-size: 14px;
+  }
+  button.copy:active { transform: translateY(1px); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>把「日程表」装到手机上</h1>
+  <p class="lead">
+    一个<b>本地优先</b>的日程 / 课程表工具：电脑上是网页 + 一块飘在桌面上的气泡区，
+    手机上是一个 App（安卓 / iOS 各自是一个原生外壳，里面跑的是同一份界面与同一份核心逻辑）。
+    <b>数据全部存在你自己的设备上</b> —— 不注册、不登录、不上传、没有云。
+  </p>
+</header>
+
+<!-- 微信内置浏览器：会拦 .apk 下载，所以先把话说明白（这条只在 MicroMessenger 下显示）。 -->
+<div class="wx">
+  <div class="wx-tip">
+    <b>你在微信里打开的这一页。</b>
+    微信会拦掉 <code>.apk</code> 下载：请点右上角 <b>⋯</b> → <b>在浏览器打开</b>，再点下面的下载按钮。
+    <div><button class="copy" id="copy-url" type="button">复制本页地址</button></div>
+  </div>
+</div>
+
+<div class="btns">
+  <a class="btn" href="https://github.com/4shy4/timetable/releases/latest">下载安卓版 APK（4.6 MB）</a>
+  <a class="btn ghost" href="https://4shy4.github.io/bubble-schedule/">先玩网页 demo，不用装</a>
+</div>
+<p class="under">
+  安卓：装的时候系统会问一次「允许安装未知应用」。这个包用一把<b>固定的密钥</b>签名，
+  所以以后的版本能直接覆盖安装，数据不会丢。
+</p>
+<p class="under">
+  那个 demo 是<b>气泡面板</b>那一块的网页演示（同一套界面），刷新就回到初始数据；它可能比最新版旧一点。
+</p>
+
+<h2>手机上打开这一页</h2>
+<div class="qr">
+  <!-- 二维码是**静态 SVG**（build 时生成，见 tools/make-install-qr.mjs）：
+       不跑 JS 也能显示 —— 会扫这个码的，往往正是最老的那批浏览器。
+       尺寸 185 = 37 × 5：qr.svg 是 33 个模块 + 两边各 2 格静区 = 37 格宽，
+       取格数的整数倍，模块边缘才落在整像素上（不取整数倍会被抗锯齿糊掉）。 -->
+  <div class="box"><img src="qr.svg" width="185" height="185" alt="扫码打开这一页：https://4shy4.github.io/bubble-schedule/install.html" /></div>
+  <div class="side">
+    <p>扫码，或者用手机浏览器打开：<br />
+      <a href="https://4shy4.github.io/bubble-schedule/install.html">4shy4.github.io/bubble-schedule/install.html</a>
+    </p>
+    <p class="dim" style="font-size:13.5px">这个码指向的就是你正在看的这一页（不是直接指向 .apk）：因为微信会拦安装包，iPhone 又用不上它 —— 先落到这里，才知道自己该走哪条路。</p>
+  </div>
+</div>
+
+<h2>按你的设备选一条路</h2>
+
+<div class="card">
+  <h3>安卓手机 / 平板 <span class="dim" style="font-weight:400">（最省事）</span></h3>
+  <ol>
+    <li>点上面的<b>下载安卓版 APK</b>，下到手机里（或用电脑下载后拷进手机）。</li>
+    <li>点开这个文件安装；系统会问一次「允许安装未知应用」，同意即可。</li>
+    <li>如果你之前装过<b>调试版</b>，会提示「应用未安装」—— 先卸载旧的那个再装（卸载会清掉手机上那份数据）。</li>
+  </ol>
+  <p class="dim" style="font-size:13.5px">闹钟走系统闹钟（能穿透省电模式）；日程存在 App 的私有目录里。</p>
+</div>
+
+<div class="card">
+  <h3>iPhone / iPad</h3>
+  <p>这个 APK 是安卓的，iPhone 用不上。你有两条路：</p>
+  <p><span class="k">① 网页版（只想在手机上看看、用用）：</span>
+    在你自己的电脑上把程序跑起来（<code>git clone</code> 后 <code>node server/main.js --lan</code>，
+    启动日志里会打印一个局域网地址），然后在 iPhone 的 <b>Safari</b> 里打开那个地址 →
+    分享 → <b>添加到主屏幕</b>。它就是一个能全屏、能收通知（iOS 16.4+）的网页版，
+    数据仍然在你自己电脑上。</p>
+  <p><span class="k">② 原生 App（想要真闹钟）：</span>
+    <code>ios/</code> 是一个 Swift 外壳（AlarmKit + WebKit），仓库里<b>没有</b>预编译的 IPA，
+    也不提供免签名的安装方式 —— 需要你自己装 Xcode、生成工程、填上你自己的签名再装。</p>
+</div>
+
+<div class="card">
+  <h3>在微信里打开</h3>
+  <p>点右上角 <b>⋯</b> → <b>在浏览器打开</b>。微信会拦掉 <code>.apk</code> 下载，这不是页面坏了。</p>
+  <p class="dim" style="font-size:13.5px">网页 demo 在微信里是能直接玩的（它只是个网页）；要装 App 就得先出微信。</p>
+</div>
+
+<h2>下载前，先核对一下文件</h2>
+<div class="card">
+  <p>当前版本 <b>v0.12.0</b>（以 <a href="https://github.com/4shy4/timetable/releases/latest">Releases</a> 页面上的数字为准）：</p>
+  <ul>
+    <li>文件名：<code>Timetable-Android-0.12.0.apk</code></li>
+    <li>大小：<b>4,655,170 字节</b>（4.44 MiB）</li>
+    <li>签名证书 SHA-256：<span class="hash">51706b2de30d3bba6baf1065a2b27c4ff8f27daeb08ec33bc132e6f34b3928a7</span></li>
+  </ul>
+  <p>整个文件的 SHA-256：</p>
+  <p class="hash">ceba3ae6a07cd0e155dd202d2db38323ff8ef517c6a4d15e8429a1806f16f773</p>
+  <p>自己算一遍：</p>
+  <ul>
+    <li>Windows：<code>certutil -hashfile Timetable-Android-0.12.0.apk SHA256</code></li>
+    <li>macOS / Linux：<code>shasum -a 256 Timetable-Android-0.12.0.apk</code></li>
+  </ul>
+  <p class="dim" style="font-size:13.5px">对不上就别装 —— 说明这个文件不是发布的那一个（可能是下载被中间劫持或截断了）。</p>
+</div>
+
+<h2>你的数据在哪</h2>
+<div class="card">
+  <ul>
+    <li>电脑上：仓库里的 <code>data/</code>（<code>db.json</code> / <code>fired.json</code> / <code>server.log</code>）</li>
+    <li>安卓：App 的私有目录</li>
+    <li>iOS：App 的沙盒</li>
+  </ul>
+  <p>没有账号、没有埋点、没有服务端。<span class="dim">这个下载页同样是单文件、零外部资源 —— 打开它不会向任何第三方发请求。</span></p>
+</div>
+
+<footer>
+  源码：<a href="https://github.com/4shy4/timetable">github.com/4shy4/timetable</a>（MIT）·
+  demo 仓库：<a href="https://github.com/4shy4/bubble-schedule">bubble-schedule</a>
+</footer>
+
+</div>
+
+<!--
+  ⚠️ 发新版时要改的数字只有三处（都在上面「下载前，先核对一下文件」那一节）：
+     版本号、字节数、SHA-256；签名证书指纹在换密钥之前是不变的。
+     别忘了跑一遍：node tools/make-install-qr.mjs（只在**网址**变了时才需要重跑）。
+-->
+<script>
+  // 微信内置浏览器：只加一个 class 让上面的提示块显示出来。没有网络请求，没有依赖。
+  (function () {
+    try {
+      if (/MicroMessenger/i.test(navigator.userAgent)) document.documentElement.className += ' wechat';
+    } catch (e) { /* 老内核里 UA 读不到就算了，不影响别的 */ }
+  })();
+
+  // 复制本页地址：微信里没法点「在新标签打开」，所以给一个能粘贴走的按钮。
+  (function () {
+    var b = document.getElementById('copy-url');
+    if (!b) return;
+    b.addEventListener('click', function () {
+      var url = location.href;
+      var done = function () { b.textContent = '已复制 ✓'; setTimeout(function () { b.textContent = '复制本页地址'; }, 1600); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(done, fallback);
+      } else { fallback(); }
+      function fallback() {
+        // 老内核 / 非 https：用最原始的办法（选中 + execCommand）
+        try {
+          var t = document.createElement('textarea');
+          t.value = url; t.setAttribute('readonly', '');
+          t.style.position = 'fixed'; t.style.opacity = '0';
+          document.body.appendChild(t); t.select();
+          document.execCommand('copy');
+          document.body.removeChild(t);
+          done();
+        } catch (e) { b.textContent = '请长按地址栏复制'; }
+      }
+    });
+  })();
+</script>
+</body>
+</html>

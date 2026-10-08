@@ -83,7 +83,61 @@ body {
 
 .demo-hint b { color: #e2e8f0; }
 
+/* 「下载到手机」：一行小字，靠右放（margin-left:auto 在 flex 里就是推到最右）。 */
+.demo-install {
+  margin-left: auto;
+  color: #cbd5e1;
+  text-decoration: none;
+  border-bottom: 1px dashed rgba(148, 163, 184, 0.5);
+}
+.demo-install:hover { color: #fff; border-bottom-color: #fff; }
+
+/* 只在微信里显示的那句（微信会拦 .apk 下载）。
+   ⚠️ .demo-hint 本身是 pointer-events: none（免得挡住气泡），
+      所以里面这个链接要单独把事件收回来，否则点不动。 */
+.wx-only { display: none; }
+html.wechat .wx-only { display: inline; }
+.wx-only a { color: #93c5fd; pointer-events: auto; }
+
+/* ---- 载入失败的兜底面板 ----
+   ⚠️ 两个触发条件都写成 class（`.on` / `html.no-module`），**不要**用 hidden 属性：
+      一旦给 .boot-error 写了 display，UA 的 [hidden] { display: none } 就会被压过去，
+      面板会在正常载入时也显示出来。
+   正常载入时它是 display:none 的，不占位、不挡点击。 */
+.boot-error { display: none; }
+.boot-error.on,
+html.no-module .boot-error {
+  display: flex;
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: #0b1020;
+}
+.boot-error-in {
+  max-width: 460px;
+  padding: 22px 24px;
+  border-radius: 14px;
+  background: rgba(21, 27, 48, 0.96);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  color: #cbd5e1;
+  font-size: 14px;
+  line-height: 1.7;
+}
+.boot-error h1 { margin: 0 0 10px; font-size: 18px; color: #e2e8f0; }
+.boot-error b { color: #e2e8f0; }
+.boot-url {
+  word-break: break-all;
+  font-size: 12px;
+  color: #94a3b8;
+}
+.boot-go { color: #93c5fd; text-decoration: none; border-bottom: 1px dashed #93c5fd; }
+
 @media (max-width: 560px) {
   .demo-hint { font-size: 11px; padding: 6px 9px; }
   .demo-bar { font-size: 12px; padding: 6px 9px; }
+  /* 窄屏上顶部那条会换行，「下载到手机」就别再抢最右边了（否则它自己占一行） */
+  .demo-install { margin-left: 0; }
 }
