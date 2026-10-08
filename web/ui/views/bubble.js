@@ -39,7 +39,7 @@ import { festivalArt } from '../../../core/festival-art.js';
 import { FESTIVALS, FESTIVAL_COLORS } from '../../../core/holidays.js';
 // 「到期/过期」只有一个定义在 core/state-ops.js（方案 C：到期 = 结束时间）
 import * as stateOps from '../../../core/state-ops.js';
-import { asDate, hhmm } from '../../../core/time.js';
+import { hhmm } from '../../../core/time.js';
 import {
   URGENCY_TIERS, tierByKey, tierFill, tierTextColor,
   radiusRangeForCanvas, areaScaleForCanvas, RADIUS_MIN_FLOOR,
@@ -49,7 +49,6 @@ import { bubbleStyle, levelOf } from '../../../core/urgency.js';
 import {
   LEVELS, levelByKey, canNestInside, allowedChildLevels, isLeafLevel, rankOf,
 } from '../../../core/level.js';
-import { formatRemaining } from '../../../core/countdown.js';
 // 每颗泡泡「喂给 canvas 的全部数字」—— 纯函数在 core，这里只负责测量文字 + 画。
 // ⚠️ 抽出来的理由（用户报的 iPad 故障）：数字散在这一百多行里时，
 //    **一个字段变 NaN 只能靠肉眼在平板上猜**；集中到 core 之后它能被 Node 单测逐字段钉死，
@@ -58,9 +57,17 @@ import {
   drawNumbersOf, bubbleDrawDiagnostic, alphaOfStyle, isFiniteNumber, SAFE_RADIUS, SAFE_FALLBACK_ALPHA,
 } from '../../../core/bubble-draw-numbers.js';
 import { emptyState } from '../viewkit.js';
-import { wrapTextToFit, ellipsize } from '../textfit.js';
+import { wrapTextToFit } from '../textfit.js';
 import * as store from '../../adapter/store.js';
 import { toast } from '../toast.js';
+// 手势状态机（长按/轻点/拖动/取消）—— 抽到单独模块是为了**在 Node 里能用手势序列测**，
+// 也为了让"长按计时"离渲染帧远远的（见下面 startSimulation 里那段长注释）。
+import { createBubbleGesture, LONG_PRESS_MS, MAX_TAP_SLOP_PX } from '../bubble-gesture.js';
+// 帧回调的最后一道护栏：任何异常都不许让 rAF 的续排停掉（"泡泡隐身 + 长按失效"的一半根因）
+import { runGuardedFrame, createOnceReporter } from '../frame-guard.js';
+// 手势诊断角标（默认关闭）：把"屏幕上发生了什么"变成用户能照着念的一行字。
+// ⚠️ 它存在的理由见 bubble-diag.js 文件头 —— 平板上没有控制台，界面自己说话是唯一的诊断手段。
+import { createBubbleDiag, diagRequested, DIAG_KEY } from '../bubble-diag.js';
 
 void tierFill;
 
@@ -76,12 +83,89 @@ const SHOW_DONE_KEY = 'timetable.bubble.showDone';
  */
 const SHOW_COURSE_KEY = 'timetable.bubble.showCourse';
 // 节日气泡：还剩几天时浮出来（用户定的默认 4 天，可调；0 = 不显示）
-const FESTIVAL_DAYS_KEY = 'timetable.bubble.festivalDays';
+// ⚠️ 这个键**导出**了：首次引导（web/ui/presets-ui.js）第二问答"不要节日"时要把它设成 0 ——
+//    网页气泡区的显示偏好真值就在 localStorage 里，而 core/ 不许碰 localStorage，
+//    所以只能由界面这一层来写。键名**只有这一份定义**，别在别处再抄一个字符串。
+export const FESTIVAL_DAYS_KEY = 'timetable.bubble.festivalDays';
 
-/** 长按多久算"戳破"（用户指定 2.5 秒） */
-const LONG_PRESS_MS = 2500;
+/**
+ * 读"要不要显示手势诊断角标"。
+ *
+ * ⚠️ 整段包 try/catch：`location.search` / `localStorage` 在某些宿主（无痕、
+ *    被策略禁掉的 WebView、被当成模块 import 进 Node 测试桩）会**抛**。
+ *    "读一个偏好设置"把气泡区搞崩是绝对不能接受的 —— 读不到就当关闭。
+ */
+function diagOnNow() {
+  try {
+    return diagRequested(location.search, localStorage);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 「当前版本」这一行 —— **复用已有的版本来源，不新造版本号**。
+ *
+ * 两个来源，按拿得到与否排：
+ *   ① `state.health.version`：电脑端由 `server/api.js` 从 **package.json** 读出来
+ *      （那里的注释写着"不要在这里写死"）—— 这是"版本"唯一的真源。
+ *   ② **预缓存版本**：`web/sw.js` 里那个 `CACHE` 名（`timetable-shell-v22`）。
+ *      为什么要它：iPad 是本机模式，`/api/health` 不存在（`LocalServer.swift` 只发静态文件，
+ *      `/api/*` 一律回"不是数据"），所以①在平板上拿不到。而 `CACHE` 这个号
+ *      **本来就是"每改一次 web 内容就升一号"**（见 sw.js 顶部 v5…v21 的来历）——
+ *      也就是说"网页这一层是不是新包"**已经有一个来源了**，不需要新造。
+ *
+ * ⚠️ 拿不到就如实写"未知"，**绝不编一个版本号**：编了比没有更糟 ——
+ *    用户会以为装对了，而"装的是不是新包"正是最需要确认的那件事。
+ */
+let shellTag = '';
+let shellTagAsked = false;
+function shellTagText() {
+  if (!shellTag && !shellTagAsked) {
+    shellTagAsked = true;   // 只问一次（异步，拿到就存下来给后续渲染用）
+    try {
+      if (typeof caches !== 'undefined' && caches && typeof caches.keys === 'function') {
+        caches.keys().then((keys) => {
+          const k = (keys || []).map(String).find((x) => x.startsWith('timetable-shell-'));
+          if (k) shellTag = k.replace('timetable-shell-', '预缓存 v');
+        }).catch(() => { /* 拿不到就算了，显示"未知" */ });
+      }
+    } catch { /* 有些宿主访问 caches 就会抛 */ }
+  }
+  return shellTag;
+}
+
+/**
+ * 给「?」面板与诊断角标共用的一行版本说明（两边必须是**同一个**来源，否则会互相矛盾）。
+ *
+ * ⚠️ 这里返回的是**标签本身**（不带 `v` 前缀）：角标那边自己会写成 `v=…`，
+ *    面板那边写成 `当前版本 …`。前缀写在这两个地方，别写进这里 ——
+ *    否则会出现 `v=v0.10.14` 这种一眼就不对的东西（第一版就是这样）。
+ */
+function versionLabel(state) {
+  const h = state && state.health;
+  if (h && h.version) return `${h.version}（电脑服务）`;
+  const shell = (typeof window !== 'undefined' && window.__timetableInShell)
+    ? `App 包（外壳 ${window.__timetableInShell}）`
+    : '网页';
+  const tag = shellTagText();
+  return tag ? `${shell} · ${tag}` : `${shell} · 预缓存未知`;
+}
+
+/**
+ * 长按多久算"戳破"（用户指定 2.5 秒）—— 真值住在 `web/ui/bubble-gesture.js`。
+ *
+ * ⚠️ 以前这里有一份 `const LONG_PRESS_MS = 2500`，手势模块也各写各的阈值。
+ *    同一个数存在两份，就会出现"改了一处、另一处没改"这种最难查的偏差
+ *    （这个项目在"双击窗口"上踩过：鼠标阈值和手指阈值是两个数，改一个忘一个）。
+ *    所以现在**只留模块里那一份**，这里 import 进来。
+ *    `MAX_TAP_SLOP` 同理（改动/轻点的位移阈值）。
+ */
+
 /** 长按进度条的最大半径（画在气泡外圈） */
 const LONG_PRESS_RING = 1.22;
+/** 轻点 vs 拖动的位移阈值 —— 真相在 bubble-gesture.js 的 MAX_TAP_SLOP_PX */
+const MAX_TAP_SLOP = MAX_TAP_SLOP_PX;
 
 // ---------- 漂浮参数 ----------
 const MAX_SPEED = 26;        // px/s，慢悠悠才像气泡
@@ -186,6 +270,24 @@ export const bubbleView = {
      * 不用再猜业务逻辑（iPad 上排查"单击背景无响应"就靠这个分叉）。
      */
     const tapRipple = el('div.bubble-tap-ripple');
+    /**
+     * 手势被**系统打断**时的提示条（平时隐藏）。
+     *
+     * 为什么需要它：被系统打断（第二根手指、系统长按菜单、切到后台）时，
+     * 用户看到的和"完全没按到"**一模一样** —— 都是什么都不发生。
+     * 加这一行字，就把"这次长按为什么没成"变成了可读的信息；
+     * 平板上没有控制台，界面自己说话是唯一的诊断手段。
+     */
+    const holdHint = el('div.bubble-hold-hint', { hidden: true });
+    /**
+     * 手势诊断角标（**默认关闭**；`?diag=1` 或「?」面板里的开关打开）。
+     *
+     * 为什么要有它：平板上没有控制台，而"长按没反应"这类报障的全部信息都在
+     * **原始事件有没有到**这件事上 —— 只有界面自己能说出来（见 web/ui/bubble-diag.js）。
+     * ⚠️ `pointer-events: none` 在 CSS 里（`.bubble-diag`）：它是诊断器，
+     *    **绝不能把长按手势吃掉**，否则"为了看清为什么没反应"反而制造了新的没反应。
+     */
+    const diagBadge = el('div.bubble-diag', { hidden: !config.diag, 'aria-label': '手势诊断角标' });
     const backBtn = el('button.icon-btn.bubble-hud-btn', {
       type: 'button', title: '退出一层（也可以双击背景）', 'aria-label': '退出一层', text: '↩',
     });
@@ -262,7 +364,7 @@ export const bubbleView = {
 
     // 说明面板：点 ? 才出现（默认隐藏，不占版面）
     const panel = el('div.bubble-panel.bubble-help', { hidden: true });
-    const stage = el('div.bubble-stage', {}, [canvas, tapRipple, insideHint, hud, panel, dropzoneEl]);
+    const stage = el('div.bubble-stage', {}, [canvas, tapRipple, insideHint, hud, panel, holdHint, diagBadge, dropzoneEl]);
     const legend = el('div.bubble-legend');
 
     // 进入气泡后：容器变成这层画布的背景色（视觉上"我们在这个气泡里面"）
@@ -274,7 +376,7 @@ export const bubbleView = {
     //    `ReferenceError: tapRipple is not defined`：涟漪不出现（这一层看得出来），
     //    但下面的 `local.setSelected(null)` 也被跳过，整条背景点击路径**没有报错、
     //    看着还"能工作"**（气泡照样加得出来）—— 正是那种最难发现的半坏。
-    const local = { selected: null, panel, legend, config, pickChip, setDropMode, dropzoneEl, tapRipple };
+    const local = { selected: null, panel, legend, config, pickChip, setDropMode, dropzoneEl, tapRipple, holdHint, diagBadge };
     // ⚠️⚠️ `state` 必须传进去 —— 这是用户报的"**单击母气泡背景加不了子泡泡**"的真根因。
     //
     //    `renderPanel` 的函数体里有两处自由变量 `state`（`hudHint(state)` /
@@ -311,6 +413,8 @@ export const bubbleView = {
       events: state.events,
       // 用户给某个节日换的图（方案 C）；没换的走矢量图案（方案 A）
       customArt: (state.settings && state.settings.festivalArt) || {},
+      // 「当前版本」的真源（见 versionLabel）：角标与「?」面板共用同一份，不许各写一个
+      versionOf: () => versionLabel(state),
     });
     activeStop = stop;
 
@@ -516,6 +620,8 @@ function readConfig() {
     showDone: localStorage.getItem(SHOW_DONE_KEY) === '1',
     // 没设过就是显示（保持老行为）
     showCourse: localStorage.getItem(SHOW_COURSE_KEY) !== '0',
+    /** 手势诊断角标：**默认关闭**（`?diag=1` 或「?」面板里的开关） */
+    diag: diagOnNow(),
     festivalDays: (() => {
       const raw = localStorage.getItem(FESTIVAL_DAYS_KEY);
       if (raw === null) return BUBBLE_VIEW_DEFAULTS.festivalDays;
@@ -984,6 +1090,34 @@ function renderPanel(host, legendHost, config, ctx, local, state) {
       el('span.bubble-tool-label', { text: '天前出现（0 = 不显示）' }),
     ]),
     festivalArtBlock(state, rerender),
+
+    // —— 排障：手势诊断角标（**默认关闭**）——
+    //
+    // 为什么放在这里：平板上没有控制台。长按没反应时，"原始事件到底有没有到"
+    // 这件事只有屏幕自己能说出来（见 web/ui/bubble-diag.js）。打开之后角标上会出现
+    // 一行形如 `down=3 move=41 cancel=1 up=2 · last=pointercancel · hold=1.2s/2.5s · ev=pointer`
+    // 的字 —— 用户照着念一遍，断在哪一环就清楚了。
+    el('div.bubble-help-title', { text: '排障' }),
+    el('label.switch-row', {}, [
+      el('span', { text: '显示手势诊断角标（长按没反应时打开）' }),
+      el('input', {
+        type: 'checkbox',
+        checked: config.diag,
+        onchange: (e) => {
+          // ⚠️ 存不上（无痕 / 策略禁用）也要让**这一次会话**生效，所以先写再重渲染：
+          //    写失败时 diagOnNow() 会退回"关闭"，用户会看到勾选框又弹回去 —— 那也算如实反馈。
+          try { localStorage.setItem(DIAG_KEY, e.target.checked ? '1' : '0'); } catch { /* 忽略 */ }
+          rerender();
+        },
+      }),
+    ]),
+    /**
+     * 「当前版本」——**用户唯一能自己确认"装的是不是新包"的地方**。
+     * 复用已有的两个版本来源（见 versionLabel 的注释），不新造版本号。
+     * 也可以直接在地址后面加 `?diag=1`：一次性的、刷新即失效。
+     */
+    el('p.tiny', { text: `当前版本 ${versionLabel(state)}　·　临时排障：地址后加 ?diag=1（刷新即失效）` }),
+
     // 课程开关（用户要求）：课程是周期性的，气泡区更适合放临时事务。
     // 用 `label.switch-row` 的现成样式（勾选框 + 文字一行，点哪都能切换）。
     el('label.switch-row.bubble-course-toggle', {}, [
@@ -1092,13 +1226,15 @@ function renderLegend(host) {
 }
 
 // ---------- 动力学模拟 ----------
-function startSimulation({ canvas, items, config, ctx, local, events = [], customArt = {} }) {  const ctx2d = canvas.getContext('2d');
+function startSimulation({ canvas, items, config, ctx, local, events = [], customArt = {}, versionOf = null }) {  const ctx2d = canvas.getContext('2d');
   if (!ctx2d) return () => {};
 
   const dpr = Math.min(2, window.devicePixelRatio || 1);
   let width = 0;
   let height = 0;
   let raf = 0;
+  /** 视图是否已经停掉：停掉之后帧循环不许再续排、手势定时器必须已清（见 stop()） */
+  let stopped = false;
   let last = performance.now();
   let time = 0;
 
@@ -1517,7 +1653,20 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
     // 0) 过期的刺：从泡壁**向内**长一圈尖刺（用户要求"向内长出一圈刺"）。
     //    先画，后面泡体盖上去，只留刺尖露在泡内，看起来是扎进泡里的。
     //    只有「自己过期」才长刺 —— 容器过期的那颗自己还没到期，不该被刺。
-    if (v.ownOverdue) drawOverdueSpikes(ctx2d, b, v);
+    //
+    // ⚠️ 单独包一层 try/catch（外面 paintBubble 那一层是兜底，这里是"就近止损"）：
+    //    刺挂了只该让这颗泡泡少一圈刺，不该把**泡体本身**也丢掉。
+    //    这是"帧里可能抛的地方"清单上的一处（见 frameBody 的注释）。
+    if (v.ownOverdue) {
+      try {
+        drawOverdueSpikes(ctx2d, b, v);
+      } catch (err) {
+        if (!spikeDrawWarned) {
+          spikeDrawWarned = true;
+          console.error('[过期刺] 画不出来，已跳过（只报一次）：', err);
+        }
+      }
+    }
 
     // 1) 软外晕
     const glow = ctx2d.createRadialGradient(v.x, v.y, v.r * 0.7, v.x, v.y, v.r * v.glowScale);
@@ -1543,10 +1692,24 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
     // 2.5) 节日泡泡：铺一层背景图案（月亮/灯笼/粽子…，或用户自己换的图）。
     //      只给节日泡泡画 —— 普通事项泡泡上糊个图案会变成噪声。
     //
-    // ⚠️ 这里**必须兜住异常**：图案来自 core/festival-art.js 的形状清单 + 用户自己换的图，
-    //    抛一次就是"这一颗少一张背景"（现在更是只影响这一颗，见 paintBubble 的边界）。
+    // ⚠️⚠️ 这一段的写法是"**异常之后无法回滚**"的正面例子，别改回旧的写法。
+    //
+    //    旧版这里是：
+    //        try { drawFestivalArt(...) } catch { …… ctx2d.restore && ctx2d.restore(); }
+    //    而 `drawFestivalArt` **自己内部**有成对的 save()/restore()（它要 clip 成圆）。
+    //    于是这个 catch 变成一次**不对齐的 restore()**：
+    //      · 如果 throw 发生在它内部 save() **之前**（例如 festivalArt() 解析形状清单时抛）
+    //        → 这一句 restore 弹掉的是**别人**的 save，canvas 状态栈从此错位；
+    //      · 错位的后果不是"这一颗画错"，而是**后续所有泡泡的 globalAlpha / clip
+    //        继承了一个不该存在（或少了）的状态** —— 画是能画，但整体颜色/裁剪会不对，
+    //        看起来正好像"某几颗泡泡隐身了"。
+    //
+    //    所以这里的边界改成：**进了这一步就一定会把状态恢复到我进来时的样子**，
+    //    无论里面抛成什么样。做法是把 save 提到调用方（这里），
+    //    并让 `drawFestivalArt` 变成"只画、不碰状态栈"。
     const festKey = b.item && b.item.event && b.item.event.festivalKey;
     if (festKey) {
+      ctx2d.save();
       try {
         drawFestivalArt(ctx2d, b, v.r, festKey, customArt, alpha);
       } catch (err) {
@@ -1554,7 +1717,10 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
           artDrawWarned = true;
           console.error('[节日图案] 画不出来，已跳过（只报一次）：', festKey, err);
         }
-        ctx2d.restore && ctx2d.restore();
+      } finally {
+        // save/restore 在这里**严格配对**（上面那句 ctx2d.save 就在同一个分支里），
+        // 不会多弹一层、也不会漏恢复。
+        ctx2d.restore();
       }
     }
 
@@ -1672,12 +1838,29 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
     }
 
     // 7b) 长按进度环：按住 2.5 秒就戳破，环走满即触发
-    if (v.hold > 0.001) {
+    //
+    // ⚠️⚠️ **字段名是 `holdProgress`，不是 `hold`** —— 这里曾经写错，代价就是用户报的
+    //     "长按完全没看到（进度）环"，而且**跨设备、跨平台全都一样**（桌面鼠标也一样）。
+    //
+    // 为什么错得这么久还全绿（这一条比 bug 本身重要）：
+    //   · 这些数字现在在 `core/bubble-draw-numbers.js` 里**集中产出**，名字叫
+    //     `holdRingR / holdProgress / holdWidth`（见那里的"长按进度环"三行）；
+    //   · 而 `tools/bubble-finite.test.mjs` 复刻绘制形状时用的是**正确**名字
+    //     （它写 `v.holdProgress`）→ **产出方被测住了，消费方读错名字没人管**；
+    //   · 读错名字**不会抛**：`v.hold === undefined`，于是 `undefined > 0.001`
+    //     **恒为 false**，下面那两句 `arc/stroke` 一次都不执行 —— 没有报错、没有 toast、
+    //     单击/双击/拖动毫发无损，只有"按住时那圈红环"永远不出现。
+    //     这正是最难查的一类：**静默、无害、只影响一个视觉反馈**。
+    //
+    // 所以配套加了一条**机械化对账断言**（`tools/bubble-longpress-hooks.test.mjs`）：
+    //   把 `drawNumbersOf()` 真正返回的键，和这个函数里读的每一个 `v.<字段>` 逐个比对，
+    //   少一个就红。以后谁再改名字/写错名字，那个套件立刻拦住，不再靠人眼。
+    if (v.holdProgress > 0.001) {
       ctx2d.beginPath();
-      ctx2d.arc(v.x, v.y, v.holdRingR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * v.hold);
+      ctx2d.arc(v.x, v.y, v.holdRingR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * v.holdProgress);
       ctx2d.lineWidth = v.holdWidth;
       ctx2d.lineCap = 'round';
-      ctx2d.strokeStyle = `rgba(239,68,68,${0.55 + 0.35 * v.hold})`;
+      ctx2d.strokeStyle = `rgba(239,68,68,${0.55 + 0.35 * v.holdProgress})`;
       ctx2d.stroke();
       ctx2d.lineCap = 'butt';
     }
@@ -1835,11 +2018,43 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
     }
   }
 
-  function frame(now) {
+  /**
+   * 帧回调 —— **整帧包在护栏里**（见 `web/ui/frame-guard.js`）。
+   *
+   * ⚠️⚠️ 用户报的"长按 2.5 秒无响应"是**两个原因叠在一起**：
+   *   ① 长按的计时活在帧循环里（已改：见 bubble-gesture.js，现在挂在 setTimeout 上）；
+   *   ② 帧里**任何一处**抛出都会让末尾那句 `raf = requestAnimationFrame(frame)` 不再执行，
+   *      整个循环死掉 —— 泡泡不再重画（"隐身"）+ 长按再也不会被走完（"无响应"），
+   *      而单击/双击照旧（它们在 pointerup 分支里）→ 症状看起来像"只有长按坏了"。
+   *
+   * 所以这里不再"在末尾顺手写一句续排"，而是交给 `runGuardedFrame`：
+   * 它用 `finally` 保证**无论 body 怎么出去（抛了、提前 return 了）都会续排**。
+   * 异常只报一次（`createOnceReporter`），否则每帧弹一条 toast 会把屏幕刷满、
+   * 反而盖住真正的问题。
+   *
+   * ⚠️ 注意分工：护栏是**兜底**，不是"长按的正确性靠它"。长按该响就得响，
+   *    哪怕渲染循环彻底死掉（有测试专门钉这两条，见 tools/bubble-longpress.test.mjs）。
+   */
+  const reportFrameError = createOnceReporter((err) => {
+    console.error('[bubble] 这一帧出错了（循环继续，界面仍然可用）：', err);
+    toast({
+      title: '气泡区这一帧画错了',
+      body: `${(err && err.message) || err}｜循环已继续（不需要重开 App）`,
+      kind: 'err',
+      timeout: 9000,
+    });
+  });
+
+  function frameBody(now) {
     const dt = Math.min(34, now - last);
     last = now;
-    // 长按进度要每帧推进（长按 2.5 秒戳破）
-    stepHold(dt);
+    /**
+     * 长按进度：**只画，不判定**。
+     * ⚠️ 这里原来是 `stepHold(dt)` —— 进度、判定、触发三件事全在这一句里，
+     *    所以帧循环一死长按就彻底不响应。现在到点判定在 setTimeout 上（手势模块），
+     *    这一句只影响"看不看得到那圈环"。
+     */
+    paintHoldProgress();
     if (!paused) {
       time += dt;
       step(dt);
@@ -1848,12 +2063,10 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
     // 否则倒计时文字和气泡大小会冻住，必须杀进程重进才更新（见 restyleAll 的说明）。
     // 放在 step 之后、draw 之前：这样这一帧画出来的就是刚算好的新值。
     //
-    // ⚠️ 必须 try/catch。重算里一旦抛异常，异常会**从这里冒出去**，
-    //    于是函数末尾那句 `raf = requestAnimationFrame(frame)` 不再执行 ——
-    //    **整个动画循环就死了**（气泡不漂了、倒计时也不走了）。
+    // ⚠️ 这一处 try/catch **保留**（外面那层护栏是最后一道，这里是"就近处理"）：
+    //    restyleAll 挂了不该连带把这一帧的绘制也丢掉 —— 画面还是用旧数据画出来更有用。
     //    我实测踩过：restyleAll 里写错一个变量名，表现是"动都不动了"，
-    //    比原来的"时间不动"更难查。宁可真算不出来（退化成旧行为），
-    //    也不能把新加的一个功能变成整块界面停摆。
+    //    比原来的"时间不动"更难查。宁可真算不出来（退化成旧行为）。
     if (now - lastRestyle > RESTYLE_MS) {
       lastRestyle = now;
       try {
@@ -1865,9 +2078,25 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
         }
       }
     }
+    // ⚠️ draw() 内部**只**保护了"每颗泡泡"那一段；它自己的前后（clearRect、
+    //    未来的布局计算）抛出来就归外层护栏管。updateDebug 是 DOM 写入，同理。
     draw();
-    if (debugHost) updateDebug();
-    raf = requestAnimationFrame(frame);
+    // ⚠️ 调试条只在 `?debug=1` 时存在，但它也是"帧里会抛的一处"（DOM 写入）。
+    //    单独兜一下：调试信息的失败**绝不能**影响正式画面。
+    if (debugHost) {
+      try {
+        updateDebug();
+      } catch { /* 调试条坏了就少一行字，不该让循环停/画面丢 */ }
+    }
+  }
+
+  function frame(now) {
+    runGuardedFrame(() => frameBody(now), {
+      reschedule: () => { raf = requestAnimationFrame(frame); },
+      onError: reportFrameError,
+      // 视图停掉之后不许再续排（否则旧循环会和新视图的循环一起跑）
+      isStopped: () => stopped,
+    });
   }
 
   // ---------- 调试信息（?debug=1）----------
@@ -1959,14 +2188,35 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
   }
 
   // ---------- 交互 ----------
+  //
+  // ⚠️⚠️ 这一段的形状是本轮修 bug 的核心，改它之前必须读完。
+  //
+  // **用户报的 bug**（iPad 0.10.13）："长按 2.5 秒无响应"，
+  // 而且用户补了一句关键线索："之前长按有效，应该也和节日改动有关"。
+  //
+  // 老实现的形状（现在被拆掉的那一版）：
+  //   · pointerdown 记 `holdBody/holdStart`，长按的**计时/进度/判定**全在 rAF 的
+  //     `stepHold()` 里；而帧回调最后一句才是 `raf = requestAnimationFrame(frame)`。
+  //   · 帧里任何一处抛出（节日图案是后来加进绘制路径的，正好多开了几个入口），
+  //     那句续排就永远不执行 → **循环死掉**：
+  //       ① 泡泡不再重画（用户之前报的"隐身但能点到"）
+  //       ② **长按永远不触发**（计时器活在死掉的循环里）
+  //       ③ 单击/双击照旧能用（它们在 pointerup 分支里，不经过循环）
+  //     ①②③ 叠在一起就是用户看到的"只有长按没反应"。
+  //
+  // 所以现在的分工是**硬的**：
+  //   · 手势状态机（长按计时/阈值/取消/多指/contextmenu）在 `web/ui/bubble-gesture.js`，
+  //     长按触发挂在 `setTimeout` 上，**和渲染帧没有任何关系**（循环死了也能戳破）；
+  //   · 这个文件只负责"收到意图之后动泡泡 / 调 store"，以及把进度画出来；
+  //   · 帧回调整帧包在 `runGuardedFrame` 里，异常不再能掐断续排。
   let dragBody = null;
-  let pointerDownAt = 0;
-  let pointerMoved = 0;
+  /** 拖动开始那一刻泡泡在哪（`pointercancel` 时把它放回原处：被系统掐断 ≠ 用户想把它扔在那） */
+  let dragOrigin = null;
   let lastPos = null;
   let lastTapKey = null;
   let lastTapTime = 0;
-  let holdBody = null;      // 正在长按的气泡（2.5 秒戳破）
-  let holdStart = 0;
+  /** 长按中的泡泡（2.5 秒戳破）。只用来给绘制提供进度，**不参与判定**。 */
+  let holdBody = null;
   let tapTimer = 0;         // 单击/双击的判定窗口
   let bgTapAt = 0;          // 背景按下的时刻（0 = 当前不是背景手势）
   let bgTapPos = { x: 0, y: 0 };
@@ -2001,48 +2251,166 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
     tapRipple.classList.add('on');
   }
 
-  function onDown(e) {
-    const p = localPos(e);
+  /**
+   * 手指/指针按下（落在泡泡上时才开始一次拖动）。
+   *
+   * ⚠️ 背景那一支**不在这里** —— 手势模块会通过 `onPressBackground` 回调过来。
+   *    为什么分成两条：一个 pointerdown 只会命中一种目标，判定只做一次（在 `pick`），
+   *    这里只拿 `pick` 的结果办事。两个地方各写一份 `pick` 迟早会漂移。
+   */
+  function onPressBubble(p) {
     const b = pick(p.x, p.y);
-    pointerDownAt = performance.now();
-    pointerMoved = 0;
-    lastPos = p;
-    if (!b) {
-      // 点在背景上。两种可能，要等 onUp 才知道是哪一种：
-      //   · 在容器里 → 单击背景 = 往这个容器里加子气泡；双击背景 = 出去
-      //   · 在最外层 → 只是取消选中
-      bgTapAt = performance.now();
-      bgTapPos = p;
-      showTapRipple(p.x, p.y);
-      if (local.setSelected) local.setSelected(null);
-      return;
-    }
+    if (!b) return;
     bgTapAt = 0;
+    lastPos = p;
     dragBody = b;
+    dragOrigin = { x: b.x, y: b.y };
     b.dragging = true;
     // 拖动时把左侧栏变成投放区（用户的设计：投放区与左侧栏共用）
     if (currentParentId()) local.setDropMode?.(true);
+    // 按下的那一刻就把"进度环"接上（`gesture.progress()` 从这之后开始走）。
+    // ⚠️ 这一条对"长按无响应"这个报障尤其重要：**没有即时反馈时，
+    //    "按到了但没到时间"和"完全没按到"在屏幕上长得一模一样**，
+    //    用户没法判断自己按错了没有。环从 0 开始走，就是"按到了"的证据。
     b.hold = 0;
     holdBody = b;
-    holdStart = performance.now();
-    canvas.setPointerCapture?.(e.pointerId);
     canvas.classList.add('grabbing');
   }
 
-  function onMove(e) {
-    if (!dragBody || !lastPos) return;
-    const p = localPos(e);
-    pointerMoved += Math.abs(p.x - lastPos.x) + Math.abs(p.y - lastPos.y);
-    // 移动超过一点就认为"在拖"，取消长按
-    if (pointerMoved > 12 && holdBody) { holdBody.hold = 0; holdBody = null; }
-    dragBody.vx = (p.x - lastPos.x) * 3;
-    dragBody.vy = (p.y - lastPos.y) * 3;
-    dragBody.x = p.x;
-    dragBody.y = p.y;
+  function onMove(pos, dx, dy) {
+    if (!dragBody) return;
+    dragBody.vx = dx * 3;
+    dragBody.vy = dy * 3;
+    dragBody.x = pos.x;
+    dragBody.y = pos.y;
     // 拖动时也让它有一点形变，手感更"软"
     addSquash(dragBody, 1, 0, 1, Math.min(0.12, Math.hypot(dragBody.vx, dragBody.vy) / 900));
-    lastPos = p;
+    lastPos = pos;
   }
+
+  /**
+   * 手势被**取消**（`pointercancel` / 多指 / 失焦 / 长按菜单）。
+   *
+   * ⚠️ 这里必须把状态**彻底**复位，否则"被系统掐断一次之后，下一次怎么按都不灵"。
+   *    老实现的 `pointercancel` 是直接复用 `onUp` 的：它只清 hold，不清 `dragBody`
+   *    和 `dragging`（而且还会掉进"算不算轻点"的分支里）。掐断一根手指之后，
+   *    气泡就永远停在 `dragging=true` —— 物理循环里 `if (b.dragging) continue`
+   *    会让它再也不会动，下一次长按也被这颗僵住的泡泡挡住。
+   */
+  function onGestureCancel(info) {
+    const b = dragBody;
+    dragBody = null;
+    holdBody = null;
+    canvas.classList.remove('grabbing');
+    local.setDropMode?.(false);
+    if (b) {
+      b.hold = 0;
+      b.dragging = false;
+      // 被系统掐断不是"用户想把它扔在这" —— 放回按下时的位置，
+      // 一次取消不该把泡泡永久挪走（手指在玻璃上一滑就"划走一颗泡泡"最让人恼火）。
+      if (dragOrigin) { b.x = dragOrigin.x; b.y = dragOrigin.y; b.vx = 0; b.vy = 0; }
+      // 只有真有位移才动过它；纯点击被取消时不必留痕迹
+    }
+    dragOrigin = null;
+    if (info && info.reason === 'contextmenu') {
+      // 系统把这次触摸判成"想要菜单"了：给用户一句话，免得又是"无响应"
+      showHoldHint('长按被系统菜单打断了，松开再按一次');
+    }
+  }
+
+  /**
+   * 手势正常结束（松手）。
+   *
+   * ⚠️ `pointerMoved` / `pointerDownAt` 这两个自由变量**没有了**：
+   *    位移由手势模块累计（`ctx.moved`），时长也由它记 —— 一处记账，不会有第二份。
+   */
+  function onGestureRelease(c) {
+    const b = dragBody;
+    const heldMs = c.heldMs;
+    const moved = c.moved;
+    const wasHold = holdBody;
+    dragBody = null;
+    dragOrigin = null;
+    holdBody = null;
+    canvas.classList.remove('grabbing');
+    local.setDropMode?.(false);
+    // ⚠️ **这两句不能漏**：`dragging` 不清，物理循环里 `if (b.dragging) continue`
+    //    会让这颗泡泡永远不再移动（看起来"僵住了"）；`hold` 不清，那圈红色进度环
+    //    会以最后一帧的值留在泡泡上（画面上一条半截的红环，像是坏了）。
+    if (b) { b.dragging = false; b.hold = 0; }
+
+    // ---- 点在背景上：单击 = 加子气泡，双击 = 出去 ----
+    //
+    // ⚠️⚠️ 这里原来写的是 `moved < 8 && performance.now() - bgTapAt < 400`
+    //     —— **按住的时长不超过 400 毫秒**才算"轻点"。这就是 iPad 上
+    //     "单击母气泡背景想加子泡泡，一点反应都没有"的根因：
+    //       · 鼠标点一下是瞬时事件（几十毫秒），永远过关
+    //       · **手指按在玻璃上的时长普遍在 100–300ms，犹豫一下/等反馈就超过 400ms**
+    //       · 超过就 `return` —— 不报错、不提示、什么都不发生，用户只能看到"无响应"
+    //     而且前半句其实**恒等于 0**：背景这一支不会设 dragBody，`onMove` 直接 return，
+    //     `lastPos` 永远等于按下时的 `bgTapPos` —— 所以这就是一个纯粹的时长闸门。
+    //
+    //     修法（有依据，不是调参数）：**背景上没有"长按"这个手势**（长按戳破只对气泡有效），
+    //     所以时长不携带任何信息，只有"移动了多远"才有意义 —— 拖动才是另一种意图。
+    //     于是判据改成只看位移（12px 容手指抖动），时长不再参与。
+    if (!b) {
+      if (!bgTapAt) return;
+      const isTap = moved < MAX_TAP_SLOP;
+      bgTapAt = 0;
+      if (!isTap) return;
+      handleBackgroundTap();
+      return;
+    }
+
+    // ⚠️ 气泡这一支同理：400ms 对**手指**太短了。长按戳破是 2.5 秒（LONG_PRESS_MS），
+    //    而且真戳破之后 dragBody 已被清空、根本走不到这里，所以这里的时间闸门
+    //    只要卡在"不是长按"就够 —— 取长按时长的一半，给手指留足余量。
+    //
+    // ⚠️ 位移那一半用 `c.dragged`（手势模块算的"离按下点是否超过点击阈值"），
+    //    **不要**在这里再拿 `c.moved`（累计路径）比 12 —— 那是同一个坑的另一半：
+    //    手指原地来回蹭就能把累计路径顶过 12px，于是"轻点"被误判成"拖动"，
+    //    用户看到的是"点一下弹出的是拖动判定"（什么都没发生）。
+    const quick = !c.dragged && heldMs < LONG_PRESS_MS * 0.5;
+
+    // 拖过又松手（不是轻点）→ 判定"放进哪个气泡 / 是否拉出母气泡"。
+    // 只在松手时判定，所以气泡日常互相碰撞不会误触发嵌套。
+    if (!quick) {
+      if (wasHold) wasHold.hold = 0;
+      void resolveDrop(b);
+      return;
+    }
+    if (wasHold) wasHold.hold = 0;
+
+    // 单击 vs 双击：等一个"双击窗口"再决定，避免单击被双击抢掉
+    const now = performance.now();
+    if (lastTapKey === b.key && now - lastTapTime < 320) {
+      clearTimeout(tapTimer);
+      lastTapKey = null;
+      tryEnterBubble(b);                   // 双击 = 进入气泡
+      return;
+    }
+    lastTapKey = b.key;
+    lastTapTime = now;
+    if (local.setSelected) {
+      local.setSelected({ bubble: b, item: b.item, canvasW: width, canvasH: height });
+    }
+    clearTimeout(tapTimer);
+    tapTimer = setTimeout(() => {
+      if (lastTapKey !== b.key) return;
+      lastTapKey = null;
+      ctx.editEvent?.(b.item.event);       // 单击 = 编辑
+    }, 330);
+  }
+
+  /** 长按期间的即时提示（只用来给"被系统打断"这类**用户看不懂的静默失败**一个说法） */
+  function showHoldHint(text) {
+    if (holdHintTimer) clearTimeout(holdHintTimer);
+    if (!local.holdHint) return;
+    local.holdHint.textContent = text;
+    local.holdHint.hidden = false;
+    holdHintTimer = setTimeout(() => { if (local.holdHint) local.holdHint.hidden = true; }, 1800);
+  }
+  let holdHintTimer = 0;
 
   /**
    * 拖拽结束后的"归属判定"：放进某个气泡、或者拉出母气泡。
@@ -2194,71 +2562,6 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
     return false;
   }
 
-  function onUp() {
-    canvas.classList.remove('grabbing');
-    if (holdBody) { holdBody.hold = 0; holdBody = null; }
-
-    // ---- 点在背景上：单击 = 加子气泡，双击 = 出去 ----
-    //
-    // ⚠️⚠️ 这里原来写的是 `moved < 8 && performance.now() - bgTapAt < 400`
-    //     —— **按住的时长不超过 400 毫秒**才算"轻点"。这就是 iPad 上
-    //     "单击母气泡背景想加子泡泡，一点反应都没有"的根因：
-    //       · 鼠标点一下是瞬时事件（几十毫秒），永远过关
-    //       · **手指按在玻璃上的时长普遍在 100–300ms，犹豫一下/等反馈就超过 400ms**
-    //       · 超过就 `return` —— 不报错、不提示、什么都不发生，用户只能看到"无响应"
-    //     而且前半句其实**恒等于 0**：背景这一支不会设 dragBody，`onMove` 直接 return，
-    //     `lastPos` 永远等于按下时的 `bgTapPos` —— 所以这就是一个纯粹的时长闸门。
-    //
-    //     修法（有依据，不是调参数）：**背景上没有"长按"这个手势**（长按戳破只对气泡有效），
-    //     所以时长不携带任何信息，只有"移动了多远"才有意义 —— 拖动才是另一种意图。
-    //     于是判据改成只看位移（12px 容手指抖动），时长不再参与。
-    if (!dragBody && bgTapAt) {
-      const moved = Math.hypot(lastPos.x - bgTapPos.x, lastPos.y - bgTapPos.y);
-      const isTap = moved < 12;
-      bgTapAt = 0;
-      if (!isTap) return;
-      handleBackgroundTap();
-      return;
-    }
-
-    if (!dragBody) return;
-    const b = dragBody;
-    b.dragging = false;
-    dragBody = null;
-    local.setDropMode?.(false);
-    // ⚠️ 气泡这一支同理：400ms 对**手指**太短了。长按戳破是 2.5 秒（LONG_PRESS_MS），
-    //    而且真戳破之后 dragBody 已被清空、根本走不到这里，所以这里的时间闸门
-    //    只要卡在"不是长按"就够 —— 取长按时长的一半，给手指留足余量。
-    const quick = pointerMoved < 8 && performance.now() - pointerDownAt < LONG_PRESS_MS * 0.5;
-
-    // 拖过又松手（不是轻点）→ 判定"放进哪个气泡 / 是否拉出母气泡"。
-    // 只在松手时判定，所以气泡日常互相碰撞不会误触发嵌套。
-    if (!quick) {
-      void resolveDrop(b);
-      return;
-    }
-
-    // 单击 vs 双击：等一个"双击窗口"再决定，避免单击被双击抢掉
-    const now = performance.now();
-    if (lastTapKey === b.key && now - lastTapTime < 320) {
-      clearTimeout(tapTimer);
-      lastTapKey = null;
-      tryEnterBubble(b);                   // 双击 = 进入气泡
-      return;
-    }
-    lastTapKey = b.key;
-    lastTapTime = now;
-    if (local.setSelected) {
-      local.setSelected({ bubble: b, item: b.item, canvasW: width, canvasH: height });
-    }
-    clearTimeout(tapTimer);
-    tapTimer = setTimeout(() => {
-      if (lastTapKey !== b.key) return;
-      lastTapKey = null;
-      ctx.editEvent?.(b.item.event);       // 单击 = 编辑
-    }, 330);
-  }
-
   /**
    * 背景被点击（背景 = 当前这一层的"母气泡"，最外层则是没有母气泡的空白）。
    *
@@ -2334,20 +2637,38 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
     enterBubble(b.item.event.id, ctx);
   }
 
-  /** 长按进度：在主循环里推进，到 2.5 秒就戳破 */
-  function stepHold(dtMs) {
-    void dtMs;
-    if (!holdBody || !holdBody.dragging) return;
-    holdBody.hold = Math.min(1, (performance.now() - holdStart) / LONG_PRESS_MS);
-    if (holdBody.hold >= 1) {
-      const b = holdBody;
-      holdBody = null;
-      b.hold = 0;
-      b.dragging = false;
-      dragBody = null;
-      canvas.classList.remove('grabbing');
-      popBubble(b);
-    }
+  /**
+   * 长按进度：**只给画笔看**。
+   *
+   * ⚠️⚠️ 老版本的 `stepHold()` 在这里做三件事：推进进度、判定"到 2.5 秒了没有"、
+   *     到点就 `popBubble()`。三件事全在 rAF 帧回调里 —— 于是**帧循环一死，
+   *     长按就永远不触发**（用户报的"长按 2.5 秒无响应"就是这个）。
+   *
+   * 现在这里只剩"把进度搬到泡泡上"这一件事，"到没到点"由手势模块的
+   * `setTimeout` 判定（见 bubble-gesture.js 的 fireHold）。
+   * 换句话说：**这个函数一次都不跑，长按照样能戳破** —— 只是看不到那圈进度环。
+   * （有测试专门钉这一条：tools/bubble-longpress.test.mjs 的"rAF 从不回调"那条。）
+   */
+  function paintHoldProgress() {
+    if (!holdBody) return;
+    holdBody.hold = gesture.progress();
+  }
+
+  /**
+   * 长按到点了要干的事 —— 由**手势模块的定时器**调用，完全不经过渲染帧。
+   *
+   * ⚠️ 必须顺手把拖动状态收干净：否则这颗泡泡会卡在 `dragging=true`，
+   *    物理里 `if (b.dragging) continue` 会让它从此再也不动（"僵住"的泡泡），
+   *    而且 `dragBody` 留着会让后面每一次 `onMove` 都去推它。
+   */
+  function onHoldFire(b) {
+    holdBody = null;
+    dragBody = null;
+    dragOrigin = null;
+    canvas.classList.remove('grabbing');
+    local.setDropMode?.(false);
+    if (b) { b.hold = 0; b.dragging = false; }
+    void popBubble(b);
   }
 
   /** 戳破：调服务端（会释放直接子级），成功后刷新视图 */
@@ -2374,10 +2695,178 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
     }
   }
 
-  canvas.addEventListener('pointerdown', onDown);
-  canvas.addEventListener('pointermove', onMove);
-  canvas.addEventListener('pointerup', onUp);
-  canvas.addEventListener('pointercancel', onUp);
+  /**
+   * 手势模块的实例 —— **长按行为的唯一真源**。
+   *
+   * 这里只做"接线"：把回调翻译成对这个视图的实际动作。
+   * 判定逻辑（阈值、计时、取消、多指、菜单）全在模块里，因此能在 Node 里
+   * 用合成事件序列跑（`tools/bubble-longpress.test.mjs`），不必假装一个 DOM。
+   */
+  const gesture = createBubbleGesture({
+    pick: (x, y) => pick(x, y),
+    // 手指落在泡泡上：**不在这里**建 dragBody（那是 pointerdown 的处理里做的），
+    // 这里只保证背景那一支的记账不会串味（同一个 pointerdown 只会走其中一个分支）。
+    onPressBubble: (pos) => onPressBubble(pos),
+    onPressBackground: (pos) => {
+      bgTapAt = performance.now();
+      bgTapPos = pos;
+      showTapRipple(pos.x, pos.y);
+      if (local.setSelected) local.setSelected(null);
+    },
+    onMove: (pos, dx, dy) => onMove(pos, dx, dy),
+    onRelease: (c) => onGestureRelease(c),
+    onCancel: (info) => {
+      // ⚠️ 诊断先记：`onGestureCancel` 会把状态清干净，之后就没东西可记了。
+      diag.holdEnd(info && info.reason);
+      paintDiag();
+      onGestureCancel(info);
+    },
+    // 长按开始：**只有真的命中泡泡**才会来（背景不会）—— 角标靠它区分
+    // "按到了但没到时间" 和 "压根没按到泡泡"，这两个在屏幕上长得一模一样。
+    onHoldStart: () => { diag.holdStart(); paintDiag(); },
+    // 长按被取消（手指挪太多/抬起/掐断）：把环擦掉，别留一圈走了一半的红环。
+    // ⚠️ `reason` 是本次排障最有用的一个词（`drifted-too-far` / `multi-touch` /
+    //    `pointercancel` / `touchcancel` / `contextmenu` / `blur`）——
+    //    角标把它原样显示出来，用户念一句就知道断在哪条取消路径上。
+    onHoldCancel: (reason) => {
+      diag.holdEnd(reason);
+      paintDiag();
+      if (holdBody) { holdBody.hold = 0; holdBody = null; }
+    },
+    onHoldFire: (e, b) => { diag.holdFired(); paintDiag(); onHoldFire(b); },
+    // 多指：第二根手指按下时模块已经取消长按并复位了；这里给一句话，
+    // 否则"按着按着多碰了一根手指"对用户来说又是一次莫名其妙的"无响应"。
+    onExtraPointer: () => showHoldHint('检测到第二根手指，这次长按取消了'),
+  });
+
+  /**
+   * 手势诊断角标 —— **默认关闭**（`?diag=1` 或「?」面板里的开关）。
+   *
+   * 记账点选得很讲究：`diag.hit()` 一律在**真实处理器之前**调 ——
+   * 这样"事件到了但我们没处理"和"事件根本没到"能分开：前者 `last=` 会变、后者不变。
+   */
+  // ⚠️ `config.diag` 必须一起判：角标元素**总是**会被建出来（`hidden` 而已），
+  //    只判 `local.diagBadge` 的话，人人在默认关闭的情况下都会起一个 200ms 的
+  //    `setInterval` —— **测试进程会被它吊住永远不退出**（这个项目在 reminder 的
+  //    定时器上踩过同一个坑，见 tools/web-modules.test.mjs 里那段说明）。
+  const diagBadge = (config.diag && local.diagBadge) ? local.diagBadge : null;
+  const diag = createBubbleDiag({ longPressMs: LONG_PRESS_MS });
+  const paintDiag = () => {
+    if (!diagBadge) return;
+    // 版本每次重算：预缓存版本是**异步**探测的（见 versionLabel），
+    // 第一次画的时候多半还没有，拿到之后下一次重画就带上了。
+    if (typeof versionOf === 'function') {
+      try { diag.setVersion(versionOf()); } catch { /* 版本拿不到不能让角标炸 */ }
+    }
+    diagBadge.textContent = diag.text();
+  };
+  paintDiag();
+  /**
+   * 心跳：只为了让 `hold=1.2s/2.5s` 那一格**自己走**。
+   * ⚠️ 它**不是**渲染的一部分，也故意不放在 rAF 里 —— 要诊断的恰恰可能是
+   *    "帧循环不动了"，诊断器自己不能跟着一起不动（理由同 bubble-gesture.js 文件头）。
+   * ⚠️ id 必须记下来并在 stop() 里清掉：视图停掉之后还写一个不在屏幕上的节点，
+   *    会让"新视图 + 旧定时器"一起跑（这个项目在 reminder 的定时器上踩过）。
+   */
+  const diagTimer = diagBadge ? setInterval(() => { if (diag.holding) paintDiag(); }, 200) : 0;
+
+  // ---------- 事件接线 ----------
+  //
+  // ⚠️ 坐标换算只做一次：`localPos()` 把视口坐标变成**画布内坐标**，再喂给手势模块。
+  //    模块本身不认识 DOM 布局（它要能在 Node 里跑），两边口径必须一致。
+  const toLocalEvent = (e) => {
+    const p = localPos(e);
+    /**
+     * ⚠️ 指针捕获必须做，而且必须**在这里**做。
+     *
+     * 为什么：手指按住气泡挪动时可能滑出 canvas 的边界，甚至滑到 HUD 上；
+     * 没有捕获时那些 pointermove/pointerup 会送给别的元素，画布上收不到 ——
+     * 表现就是"拖到一半突然脱手"、或者更糟：**长按过程中手一滑就再也没有 pointerup，
+     * 于是这次手势永远结束不了**（下一次长按被残留状态挡住）。
+     * 捕获之后所有指针事件都保证送到 canvas。
+     *
+     * 为什么放在这个换算函数里：每个指针事件都要捕获一次（重复捕获同一个 id 是无害的），
+     * 这样不必再单独写一个 pointerdown 监听（少一处 `pick` 的重复判定）。
+     */
+    if (e.pointerId !== undefined) {
+      try { canvas.setPointerCapture?.(e.pointerId); } catch { /* iOS 上偶发失败：没捕获也能收到 */ }
+    }
+    return { pointerId: e.pointerId, pointerType: e.pointerType, isPrimary: e.isPrimary, clientX: p.x, clientY: p.y };
+  };
+
+  /**
+   * 把 TouchEvent 归一化成**和 pointer 完全一样的形状**（见 bubble-gesture.js 的"两条通道"）。
+   *
+   * ⚠️⚠️ 两处极易写错，而且错了都不报错：
+   *   ① `touchend` / `touchcancel` 时**被抬起的那根手指不在 `e.touches` 里**，
+   *      只在 `e.changedTouches` 里 —— 用 `touches[0]` 会拿到**别的手指**或者 `undefined`，
+   *      于是"松手的位置"变成 (0,0)：轻点被判成拖动、被掐断的位置也对不上。
+   *      所以按阶段选列表（`lifted`）。
+   *   ② `touchCount` 必须取 `e.touches.length` —— **还剩几根**。
+   *      end/cancel 时它 > 0 表示"还有手指按着"，那不是正常松手（手势模块按多指处理）。
+   *
+   * @param {TouchEvent} e
+   * @param {boolean} lifted 这一次是"手指抬起来/被掐断"（用 changedTouches）
+   */
+  const toLocalTouch = (e, lifted) => {
+    const list = (lifted ? e.changedTouches : e.touches) || e.touches || e.changedTouches || [];
+    const t = list[0] || (e.changedTouches && e.changedTouches[0]) || {};
+    const p = localPos({ clientX: Number(t.clientX) || 0, clientY: Number(t.clientY) || 0 });
+    return {
+      pointerId: t.identifier === undefined ? 0 : t.identifier,
+      pointerType: 'touch',
+      isPrimary: true,
+      clientX: p.x,
+      clientY: p.y,
+      touchCount: (e.touches && e.touches.length) || 0,
+    };
+  };
+
+  const gDown = (e) => { diag.hit('pointerdown'); gesture.onPointerDown(toLocalEvent(e)); diag.drove(gesture.state().channel); paintDiag(); };
+  // ⚠️ move 只记账、**不重画角标**：鼠标一动就是几十条 pointermove，
+  //    每条都写一次 textContent 是白烧电（而且用户根本读不过来）。
+  const gMove = (e) => { diag.hit('pointermove'); gesture.onPointerMove(toLocalEvent(e)); };
+  const gUp = (e) => { diag.hit('pointerup'); gesture.onPointerUp(toLocalEvent(e)); paintDiag(); };
+  const gCancel = (e) => { diag.hit('pointercancel'); gesture.onPointerCancel(toLocalEvent(e)); paintDiag(); };
+  // touch 兜底通道：归一化之后喂给**同一个**状态机；去重由模块里的"通道锁"负责，
+  // 这里**不要**自己判"pointer 是不是已经处理过了"（两份判定必然漂移）。
+  const tDown = (e) => { diag.hit('touchstart'); gesture.onTouchStart(toLocalTouch(e, false)); diag.drove(gesture.state().channel); paintDiag(); };
+  const tMove = (e) => { diag.hit('touchmove'); gesture.onTouchMove(toLocalTouch(e, false)); };
+  const tEnd = (e) => { diag.hit('touchend'); gesture.onTouchEnd(toLocalTouch(e, true)); paintDiag(); };
+  const tCancel = (e) => { diag.hit('touchcancel'); gesture.onTouchCancel(toLocalTouch(e, true)); paintDiag(); };
+
+  canvas.addEventListener('pointerdown', gDown);
+  canvas.addEventListener('pointermove', gMove);
+  canvas.addEventListener('pointerup', gUp);
+  // ⚠️ `pointercancel` **不能**再复用 pointerup 的处理（旧版就是复用的，见
+  //    onGestureCancel 的注释：它不复位 dragBody/dragging，于是掐断一次之后
+  //    气泡永远僵在拖动态、下一次长按也不灵）。
+  canvas.addEventListener('pointercancel', gCancel);
+  /**
+   * touch 兜底（**这次报障逼出来的第二条通道**）。
+   *
+   * 为什么必须有：pointer 事件是否完整送达，取决于 WebView 版本与系统手势判定，
+   * **我们无法在真机上验证**（用户看不到控制台）。touch 是 iOS 上最不可能被绕开的通道。
+   * 两条通道不会重复处理同一次触摸 —— 手势模块里有"通道锁"（谁先送到整次手势归谁），
+   * 详细理由与踩坑写在 bubble-gesture.js 文件头。**去重不要在这里再写一份。**
+   *
+   * ⚠️ `{ passive: true }`：这里**从不** preventDefault（"不滚动"是靠 CSS 的
+   *    `touch-action: none` 那条祖先链做到的，见 views.css），所以声明 passive
+   *    可以让浏览器不必等待我们的处理结果 —— 触摸响应更快，也不会触发
+   *    "touchstart 阻止了滚动"那一类控制台警告。
+   */
+  const TOUCH_PASSIVE = { passive: true };
+  canvas.addEventListener('touchstart', tDown, TOUCH_PASSIVE);
+  canvas.addEventListener('touchmove', tMove, TOUCH_PASSIVE);
+  canvas.addEventListener('touchend', tEnd, TOUCH_PASSIVE);
+  canvas.addEventListener('touchcancel', tCancel, TOUCH_PASSIVE);
+  /**
+   * `contextmenu`：iOS 13.4+ 长按可交互元素会发这个事件（长按菜单）。
+   * 不拦的话系统菜单会弹出来抢走这次长按（后面往往还跟一个 pointercancel）。
+   * 处理体在手势模块里（拦菜单 + 取消并复位），这里只负责挂上/摘掉。
+   */
+  const contextMenuHandler = (e) => { diag.hit('contextmenu'); paintDiag(); gesture.onContextMenu(e); };
+  canvas.addEventListener('contextmenu', contextMenuHandler);
   // 双击空白处 = 新建
   canvas.addEventListener('dblclick', (e) => {
     const p = localPos(e);
@@ -2392,18 +2881,65 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
   resetRequested = false;
   raf = requestAnimationFrame(frame);
 
-  const onVisibility = () => { last = performance.now(); };
+  /**
+   * 可见性 / 失焦：**必须取消长按并复位**。
+   *
+   * ⚠️ iOS 上切到别的 App、下拉通知中心、或系统弹窗抢走焦点时，
+   *    `pointerup` **可能永远不来**（指针被系统收走了）。这时如果只是"停一下"，
+   *    气泡就永远停在 `dragging=true` 上 —— 用户回到 App 之后"怎么按都没反应"。
+   *    所以这里一律走 `gesture.onBlur()`（它内部就是彻底复位）。
+   *    老版本这里只写了 `last = performance.now()`（修正帧间隔），完全没管手势状态。
+   */
+  const onVisibility = () => {
+    last = performance.now();
+    // ⚠️ 用 `hidden` 而不是"不等于 visible"：某些宿主（WKWebView 侧边预览）
+    //    拿不到准确的 visibilityState，用不等于判断会把"可见"也当成隐藏。
+    if (document.hidden) gesture.onBlur();
+  };
+  const onWindowBlur = () => gesture.onBlur();
   document.addEventListener('visibilitychange', onVisibility);
+  window.addEventListener('blur', onWindowBlur);
+
+  /**
+   * 手势状态的只读快照，**只给自动化测试用**（和上面 `window.__bubbleBodies` 同一个理由）。
+   *
+   * 为什么必须有：`tools/bubble-view-dom.test.mjs` 只能看到"最后有没有发出戳破请求"，
+   * 看不到**这一次按下到底有没有进入长按状态**（`holding`）以及**是哪条通道在带**（`channel`）。
+   * 而"按在泡泡上却没进 hold"正是这次要能一眼分开的一类故障
+   * （它和"进了 hold 但没到 2.5 秒"在屏幕上完全一样）。
+   */
+  if (typeof window !== 'undefined') {
+    window.__bubbleGestureState = () => gesture.state();
+    window.__bubbleDiag = () => diag.snapshot();
+    window.__bubbleDiagText = () => diag.text();
+  }
 
   return function stop() {
+    // ⚠️ 顺序要紧：先让手势模块清掉它自己的定时器并复位，再拆监听。
+    //    漏掉这一步的话，长按定时器会在视图销毁之后到点 —— 那是一个
+    //    "已经不在屏幕上的泡泡被戳破"的请求，比不响应更难查。
+    stopped = true;
+    try { gesture.destroy('view-stopped'); } catch { /* 停视图时不许再抛 */ }
     cancelAnimationFrame(raf);
     clearTimeout(tapTimer);
+    clearTimeout(holdHintTimer);
+    // ⚠️ 诊断心跳也要清：它是 setInterval，不清就会在视图停掉之后一直跑
+    //    （和 reminder 那两个定时器同一个坑：测试进程会被它吊住不退出）。
+    if (diagTimer) clearInterval(diagTimer);
     ro.disconnect();
-    canvas.removeEventListener('pointerdown', onDown);
-    canvas.removeEventListener('pointermove', onMove);
-    canvas.removeEventListener('pointerup', onUp);
-    canvas.removeEventListener('pointercancel', onUp);
+    canvas.removeEventListener('pointerdown', gDown);
+    canvas.removeEventListener('pointermove', gMove);
+    canvas.removeEventListener('pointerup', gUp);
+    canvas.removeEventListener('pointercancel', gCancel);
+    // ⚠️ touch 兜底那四条**必须一起摘**：漏一条就会在视图销毁之后
+    //    还在驱动一个已经死掉的手势状态机（"旧视图把新视图的泡泡戳破了"那类怪事）。
+    canvas.removeEventListener('touchstart', tDown);
+    canvas.removeEventListener('touchmove', tMove);
+    canvas.removeEventListener('touchend', tEnd);
+    canvas.removeEventListener('touchcancel', tCancel);
+    canvas.removeEventListener('contextmenu', contextMenuHandler);
     document.removeEventListener('visibilitychange', onVisibility);
+    window.removeEventListener('blur', onWindowBlur);
   };
 }
 
@@ -2425,6 +2961,8 @@ function startSimulation({ canvas, items, config, ctx, local, events = [], custo
 const FESTIVAL_ART_ALPHA = 0.42;
 /** 图案画挂了只报一次（每帧都报会把控制台刷爆，反而找不到别的问题） */
 let artDrawWarned = false;
+/** 过期刺画挂了也只报一次（同上；它是"帧内可能抛"清单上的另一处） */
+let spikeDrawWarned = false;
 
 /** 用户自己那张图的解码缓存（data URL → Image）。解码是异步的，先画别的，加载好下一帧自然就出现。 */
 const artImageCache = new Map();
@@ -2440,6 +2978,20 @@ function artImageFor(src) {
 
 /**
  * 画节日图案。坐标是 **100×100 的方框**，映射到泡泡内切圆的 ~86%。
+ *
+ * ⚠️⚠️ **本函数不许碰 canvas 的状态栈**（不 save、不 restore）—— 这是硬约定。
+ *
+ * 为什么（这一条是"泡泡隐身"那条链上的真隐患）：
+ *   这里要 `clip()` 成圆形、要压 `globalAlpha`，都需要 save/restore。
+ *   以前 save/restore 写在**函数内部**，而调用方（paintBubble）的 catch 里
+ *   又补了一句 `ctx2d.restore()` 想兜底 —— 两者一叠加就成了"对不齐的栈操作"：
+ *   throw 发生在内部 save 之前时，那句 restore 弹掉的是**别人的**状态，
+ *   于是后续所有泡泡都在一个错位的状态里画（clip 还在生效 → 后面的泡泡被裁掉
+ *   → **看起来就是"泡泡隐身了"**）。
+ *
+ * 现在：save/restore 由调用方在同一个分支里成对写死（paintBubble 的 2.5 段），
+ *   这个函数只负责"在里面画"。
+ *
  * @param {CanvasRenderingContext2D} ctx2d
  * @param {{x:number,y:number}} b 泡泡中心
  * @param {number} r 泡泡半径
@@ -2453,7 +3005,8 @@ function drawFestivalArt(ctx2d, b, r, key, customArt, alpha) {
   const x0 = b.x - 50 * s;
   const y0 = b.y - 50 * s;
 
-  ctx2d.save();
+  // ⚠️ 这里**没有** save/restore —— 由调用方（paintBubble 的 2.5 段）在同一分支里
+  //    成对写死。本函数只"在里面画"（见上面的函数注释：这是为了不让状态栈错位）。
   // 裁成圆形：图案绝不允许溢出泡泡（溢出就成了"贴纸跑了"，一眼难看）
   ctx2d.beginPath();
   ctx2d.arc(b.x, b.y, r * 0.985, 0, Math.PI * 2);
@@ -2502,7 +3055,6 @@ function drawFestivalArt(ctx2d, b, r, key, customArt, alpha) {
       }
     }
   }
-  ctx2d.restore();
 }
 
 /**

@@ -36,6 +36,10 @@
 import { displayNameOf, contactKeywords, normalizeKeywords, textOf } from './contacts.js';
 import { festivalsInYear } from './holidays.js';
 import { asDate, toDateKey } from './time.js';
+// ⚠️ 提醒的 key 必须和"通讯录页那张草稿卡片"的 key **完全一致**，否则点了通知定位不到人。
+//    那个 key 由 `taskKey()` 定义（`contactId|festival:<key>|YYYY-MM-DD`），
+//    所以这里**复用它**，绝不自己编一套（两套 key = 点进去找不到草稿）。
+import { taskKey } from './send-task.js';
 
 // ---------------------------------------------------------------------------
 // 稳定哈希（与 core/contacts.js 同一个算法 —— 换实现会让已发出的指纹失配）
@@ -707,14 +711,53 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 /**
- * 构造一次生成请求的输入。返回 `{system, user, maxTokens, temperature}`。
+ * 年份 → 生肖（十二地支）。
+ *
+ * ⚠️ 算法是 `(year - 4) % 12`（公元 4 年是鼠年），**别自己另发明一个偏移**。
+ *    这是从竞品调研里抄来的做法（ai-blessing-maker 的 `ZODIAC_ANIMALS[(year-4)%12]`），
+ *    好处是**确定性**：同一个年份永远得到同一个生肖，不会因为模型"记忆"而漂。
+ *
+ * ⚠️ 这里算的是**农历年**的生肖，而农历新年在公历 1–2 月之间 —— 所以
+ *    **1 月初到春节前那段时间，严格说还属上一个生肖**。这一处**故意不处理**：
+ *    要处理就得引入农历转换（core/holidays.js 里有那套），
+ *    而祝福语境里"年初说错了生肖"的代价，远小于为它引入一个跨模块依赖。
+ *    ⚠️ 如果哪天用户报了"春节前说错生肖"，答案就在这里 —— 用 holidays.js 的农历换算。
+ */
+const ZODIAC = Object.freeze(['鼠', '牛', '虎', '兔', '龙', '蛇', '马', '羊', '猴', '鸡', '狗', '猪']);
+export function zodiacOf(year) {
+  const y = Number(year);
+  if (!Number.isFinite(y)) return '';
+  // ⚠️ 负数取模要为真值（`-1 % 12 === -1`），所以先取整再补正
+  const i = ((Math.trunc(y) - 4) % 12 + 12) % 12;
+  return ZODIAC[i];
+}
+
+/**
+ * 给 AI 的输入契约（祝福语的 user prompt）。
+ *
+ * ⚠️ 下面这条"逐字节相同"的约束是**故意的**，别顺手破坏：
+ *    关着历史注入时，发出去的 prompt 要和"接入这个功能之前"**完全一致**
+ *    （测试用 `assert.equal` 钉住：缺参 / '' / 关着 三种给法结果全等）。
+ *    理由：这样"接了新功能之后 AI 效果变差"就能被排除掉 —— 不是新功能干的。
  *
  * ⚠️ `previousTexts` 是"**已经发给过这个人/这个节日的文本**"，必须带上：
  *    否则每年同一个节日、每次重新生成，模型会给出高度相似的句子，
  *    用户会看到"怎么又是这句"。这里只放**最近几条**（由调用方裁剪），
  *    不然 prompt 会越滚越长、成本失控。
+ *
+ * @param {object} opts
+ * @param {object} opts.festival
+ * @param {object} opts.contact
+ * @param {object} opts.profile
+ * @param {Array}  [opts.events]
+ * @param {string[]} [opts.previousTexts] 最近发给**这个人**的几条（别再来一遍）
+ * @param {Date|string|number} [opts.now]
+ * @param {string} [opts.memory] 由调用方组装好的"历史/记忆"整段（空串 = 一行都不加）
+ * @param {string} [opts.hot] 由调用方组装好的"最近热点"整段（空串/缺参 = 一行都不加）。
+ *   ⚠️ 和 `memory` 同一个模式：本模块**不认识**"热点从哪来"（那是 core/ai-hot.js 的事），
+ *   只管把它放进去。缺参时 prompt 必须与没有这个功能时**逐字节相同**。
  */
-export function buildGreetingPrompt({ festival, contact, profile, events, previousTexts, now, memory } = {}) {
+export function buildGreetingPrompt({ festival, contact, profile, events, previousTexts, now, memory, hot } = {}) {
   const c = (contact && typeof contact === 'object') ? contact : {};
   const f = (festival && typeof festival === 'object') ? festival : {};
   const p = (profile && typeof profile === 'object') ? profile : {};
@@ -770,8 +813,30 @@ export function buildGreetingPrompt({ festival, contact, profile, events, previo
     lines.push(mem);
   }
 
+  // 「参考最近的热点」（2026-10-01）：
+  //   · `hot` 由**调用方**组装（`core/ai-hot.js` 的 `hotSectionFor`）——
+  //     和 `memory` 同一个模式：本模块不认识"热点从哪来"，只管放进去。
+  //   · ⚠️ **空串/缺参就一行都不加** —— 这是"关着时 prompt 与接入前逐字节相同"那条
+  //     承诺的第二个落点（测试用 `assert.equal` 钉着）。
+  //     所以**千万不要**在这里写"如果没热点就加一句'（暂无热点）'"——那会破坏那条承诺，
+  //     而且会给模型一个"必须提热点"的暗示。
+  const hotText = hot == null ? '' : String(hot).trim();
+  if (hotText) {
+    lines.push('');
+    lines.push(hotText);
+  }
+
   lines.push('');
-  lines.push(`【今天日期】${toDateKey(at)}`);
+  // ⚠️ 年份与生肖写在这里（2026-10-01 加），理由：
+  //    用户明确要"文案可以结合**当时热点与生肖**等等"。生肖是**从年份算出来的确定性事实**
+  //    （`ZODIAC[(year-4)%12]`），而这个 prompt 原先**只给了日期不给年份** ——
+  //    模型于是只能写出"新年快乐"这种放之四海皆可的话，写不出"马年"。
+  //    ⚠️ 只加这一处、不加新段落：日期行的位置已经紧挨最后的任务指令（就近生效），
+  //       在最前面塞一大段"今年是什么年"反而会把它推远。
+  //    ⚠️ **热点不做**：那需要联网抓取 + 判断可信度，属于另一个量级的事，
+  //       不能靠"让模型自己想象今年有什么热点"（那会编出假事件）。宁可没有。
+  const zodiac = zodiacOf(at.getFullYear());
+  lines.push(`【今天日期】${toDateKey(at)}（${at.getFullYear()} 年${zodiac ? `，${zodiac}年` : ''}）`);
   lines.push('现在只输出这一条祝福语正文。');
 
   // maxTokens：写死一个够用又不会失控的上限（中文 120 字 ≈ 200 token 上下）
@@ -896,6 +961,112 @@ function dateKeyOfFestival(f) {
 }
 
 /**
+ * 把 `dueGreetings()` 的结果翻成**可以交给提醒引擎的提醒**。
+ *
+ * ⚠️⚠️ **一个节日 = 一条提醒**（2026-10-01 改过一次，这段注释记着为什么）：
+ *
+ *    第一版我按"**每人一条**"做（8 个好友 = 8 条通知），理由是"每条能单独点、单独标记"。
+ *    **用户当场否掉了**：原话"**这个祝福提醒还是一次就够了吧·-·，弹多了烦**"。
+ *    他是对的，而且这正是竞品 Birday 的做法（"多人同一天**合并成一条**通知"）——
+ *    我当时还特意在文档里写了"故意和 Birday 反着做"，现在看是**我想错了**：
+ *    祝福是一个"该做这件事了"的**待办**，不是 N 个独立事件；N 条通知只会让人想关掉这个功能。
+ *
+ *    所以：**一条通知，正文里点名列出发给谁**；点进去到通讯录页逐条处理
+ *    （那里本来就是正门：能改、能标记已发、能让 AI 润色）。
+ *
+ * ⚠️ `greetingKeys` 是**数组**（不是单个 key）：一条提醒对应多张草稿卡。
+ *    界面按它把用户送过去（第一条给焦点/滚动，其余自己也看得见）。
+ *    ⚠️ 每个 key 都必须是 `taskKey()` 的产物 —— 和通讯录页那张草稿卡片**同源**，
+ *       否则点通知会"跳过去但找不到人"（静默失败，最难查）。
+ *
+ * ⚠️ **不再需要"错开 N 分钟"**：合并成一条之后就没有"连弹一串"的问题了。
+ *    （原来那个 `staggerMinutes` 参数已删除 —— 合并之后它没有任何意义。）
+ *
+ * ⚠️ 正文里带一句离线文案（`composeGreeting` 的 offline 档，纯函数、不联网），
+ *    所以**没配 AI 也能用**。多个人时只放**第一位**的那句当示例，其余靠点进去看 ——
+ *    N 句文案拼在一条通知里必然被系统截断，反而谁都看不清。
+ *
+ * ⚠️ 返回形状**故意对齐 `core/reminder-plan.js` 的 item**（`key/title/body/fireAt`），
+ *    这样投递那一层不用为祝福开分支：
+ *    · `key` 以 `greet:` 开头 —— 和事件提醒的 key 天然不会撞（账本共用一份）；
+ *    · `eventId` 留 null：这不是日程，点通知时不该去开某条日程。
+ */
+export function greetingReminders({
+  due, contacts, profile, events, now,
+} = {}) {
+  const at = nowDate(now);
+  const list = Array.isArray(due) ? due : [];
+  // 好友查表：due 里给的是联系人对象，但调用方可能传的是"待发的那几个"，
+  // 所以这里**以 due 里的为准**，只有拿不到时才回退到全量列表里找。
+  const byId = new Map();
+  for (const c of contactsOf(contacts)) {
+    if (c && c.id != null) byId.set(String(c.id), c);
+  }
+
+  const out = [];
+  for (const d of list) {
+    if (!d || typeof d !== 'object' || !d.festival) continue;
+    const f = d.festival;
+    const date = dateKeyOfFestival(f);
+    if (!date) continue;
+    const baseAt = asDate(d.at);
+    const t0 = Number.isFinite(baseAt.getTime()) ? baseAt.getTime() : at.getTime();
+    const fname = String(f.name || f.key || '节日');
+    const pending = (Array.isArray(d.contacts) ? d.contacts : [])
+      .filter((c) => c && c.id != null);
+    if (!pending.length) continue;
+
+    const festivalKey = `festival:${String(f.key || 'unknown')}`;
+    const names = [];
+    const keys = [];
+    let firstText = '';
+    let firstTextName = '';
+    for (const c of pending) {
+      const contact = byId.get(String(c.id)) || c;
+      const displayName = String(
+        (contact && (contact.name || contact.remark || contact.nick)) || '这位好友',
+      );
+      // 离线档文案（纯函数、不联网）。拿不到就退化成"该发祝福了"，**绝不产出空消息**。
+      let text = '';
+      try {
+        text = composeGreeting({ festival: f, contact, profile, events, now: at }).text || '';
+      } catch { text = ''; }
+      if (!firstText) { firstText = text; firstTextName = displayName; }
+      names.push(displayName);
+      keys.push(taskKey({ contactId: c.id, festivalKey, dateISO: date }));
+    }
+    if (!keys.length) continue;
+
+    // 标题：人多写人数、人少写名字（一眼能认，且不要太长）
+    const title = pending.length === 1
+      ? `🎊 ${fname} · 给「${names[0]}」发祝福`
+      : `🎊 ${fname} · 该给 ${names.length} 位好友发祝福`;
+    // 正文：点名列出发给谁（人在多的时候只列前几个，够认出就行）
+    const shown = names.slice(0, 4).join('、');
+    const rest = names.length > 4 ? ` 等 ${names.length} 位` : '';
+    const who = pending.length === 1
+      ? `${firstText || `${fname}到了，给${firstTextName}写句祝福吧。`}`
+      : `要发给：${shown}${rest}。点开逐条改/发。`
+        + (firstText ? `\n示例（${firstTextName}）：${firstText}` : '');
+
+    out.push({
+      key: `greet:${festivalKey}|${date}`,
+      // 给界面用：一条提醒可能对应多张草稿卡，所以是**数组**
+      greetingKeys: keys,
+      eventId: null,
+      title,
+      body: who,
+      minutes: 0,
+      fireAt: new Date(t0),
+      reason: d.reason || 'today',
+      festivalKey: String(f.key || fname),
+      contactIds: pending.map((c) => String(c.id)),
+    });
+  }
+  return out.sort((a, b) => a.fireAt - b.fireAt);
+}
+
+/**
  * 现在该给哪些节日、哪些好友生成祝福语。
  *
  * 返回 `[{festival, contacts:[...], at:Date, reason:'today'|'lead'}]`，
@@ -912,6 +1083,9 @@ function dateKeyOfFestival(f) {
  * ⚠️ `holidays` 参数：调用方可以传 `festivalEvents(now, {days})` 的结果（气泡区已经在算）
  *    或 `festivalsInYear(y)` 的结果；**不传就用 core/holidays.js 自己算**。
  *    允许注入是为了让测试能钉死"就是今天"而不依赖真实日历。
+ *
+ * ⚠️ 要给**提醒引擎**用的话，别直接用这个形状 —— 用上面的 `greetingReminders()`
+ *    （它会把"一个节日的所有好友"拆成每人一条）。
  */
 export function dueGreetings({ now, settings, contacts, events, holidays } = {}) {
   const at = nowDate(now);

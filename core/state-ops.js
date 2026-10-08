@@ -28,6 +28,9 @@ import { mondayOf } from './time.js';
 import { markDeleted, clearTombstone, categoryOfEvent } from './sync.js';
 // 「本地活动日记」：完成/改期/戳破/逾期在这里各记一行（开关默认关，见那边文件头）
 import { logActivity } from './activity-log.js';
+// 闹钟（计时器/定时器）的纯逻辑：归一化、校验、重复规则全在 core/alarms.js ——
+// 这个文件只负责"改哪一条、怎么改"，判定一次都不复刻（见那边的文件头）。
+import { ALARM_LIMIT, normalizeAlarm, validateAlarm } from './alarms.js';
 
 const LEVEL_KEYS = new Set(LEVELS.map((l) => l.key));
 
@@ -258,6 +261,18 @@ function isoNow(now) {
 /** 找不到事件时的错误（api.js 依赖 err.status） */
 function notFound() {
   return Object.assign(new Error('日程不存在'), { status: 404 });
+}
+
+/**
+ * 找不到课程时的错误。
+ *
+ * ⚠️ 为什么**不**复用 `notFound()`：`err.message` 会被界面原样显示
+ *    （`toast({ title: '删除失败', body: err.message })`），删课时看到
+ *    「日程不存在」会让人以为点错了地方 —— 课程和日程在这个 App 里是两张表，
+ *    报错必须说清是哪一张。状态码仍然沿用既有的 404（api.js/main.js 依赖它）。
+ */
+function courseNotFound() {
+  return Object.assign(new Error('课程不存在'), { status: 404 });
 }
 
 /**
@@ -849,6 +864,15 @@ export function importCourses(db, { courses = [], meta = {}, mode = 'merge' } = 
       meetings: [{ dayOfWeek: day, sections, weeks: allWeeks, location: raw.location || '' }],
     };
     const idx = db.courses.findIndex((c) => c.key === key);
+    // 复活：这门课之前被删过（有墓碑），现在又被导进来了 → 把墓碑撤掉。
+    // ⚠️ 规则和 `upsertEvent` 的复活**同一套**（见那里"这个 id 之前被删过"那段）。
+    //    不撤会有两个**静默**的后果：
+    //      ① 用户删掉一门课、再导入同一份课表 → 课又"自己没了"（同步时按墓碑删掉）；
+    //      ② `mode:'replace'` 会先把现有课程逐条记成墓碑、再重新写入同一批 key，
+    //         而墓碑时间与 `importedAt` **是同一个时刻**（都用这一个 `at`），
+    //         而 mergeSync 的判据是「墓碑时间 >= 记录时间 → 删」——
+    //         于是整份课表会在下一次同步时凭空消失。
+    clearTombstone(db, 'courses', key);
     if (idx >= 0) {
       // 同一门课的第 2、3 次上课：并进已有记录的 meetings，而不是覆盖它（见 ②）
       const prev = db.courses[idx];
@@ -912,6 +936,124 @@ export function importCourses(db, { courses = [], meta = {}, mode = 'merge' } = 
   return { added, skipped, total: db.courses.length, problems };
 }
 
+// ---------------------------------------------------------------------------
+// 删除一门课（课表导入的反操作）
+//
+// ⚠️ 先看清楚"课程事件"的 id 是怎么生成的，再谈匹配 —— 写错一步就是**删错课**：
+//
+//   生成点在下面的 `importCourses`：`course:${key}|${day}|${sections.join(',')}`
+//   （`raw.eventKey` 可以覆盖它，但所有调用方给的都是同一个形状：
+//     core/scheduler-import.js / core/import-adapter.js / web/ui/custom-course.js。）
+//
+//   而 `key` **自己就含 `|`**（`标题|星期|节次|老师|周次`），所以：
+//     · 不能按 `|` 切分去反推 key（切出来的第一段只是标题，不是 key）；
+//     · 只能**正向**判断："这条事件的 id 是不是以 `course:<key>|` 开头"。
+//
+//   这也正是既有的"替换式导入清残留"那段代码的毛病（`.split('|')[0]` 拿出来的是
+//   标题，永远匹配不上 importedKeys 里的完整 key）—— 那处是漏删，不致命；
+//   删课这里若照抄那个写法就会**删错课**，所以下面用精确前缀。
+//
+// ---------------------------------------------------------------------------
+
+/** 一条事件的 id（或事件本身）是不是属于 `courseKey` 这门课 */
+export function isCourseEventOf(eventOrId, courseKey) {
+  const raw = (eventOrId && typeof eventOrId === 'object') ? eventOrId.id : eventOrId;
+  const id = raw == null ? '' : String(raw);
+  const key = courseKey == null ? '' : String(courseKey);
+  // ⚠️ 空 key 必须直接判 false：否则 `course:` 会匹配上**库里每一门课**的事件
+  //    （一次手滑的空参数就能清掉整张课表，而且是静默的）。
+  if (!id || !key) return false;
+  const prefix = `course:${key}`;
+  // 带 `|` 的那个分支是主路径（有 `|` 才说明后面跟的是 day/sections）；
+  // `id === prefix` 是兜底：万一某条课事件没带 meeting 后缀，它同样属于这门课。
+  return id === prefix || id.startsWith(`${prefix}|`);
+}
+
+/**
+ * 这门课在 `db.events` 里的全部伴生事件 id（删课/同步筛选共用）。
+ *
+ * ⚠️ 多了一道"**更具体的别家 key 赢了**"的判定，专门防"匹配过宽把别人的课也删了"：
+ *    课程 key 是 `标题|星期|节次|老师|周次`，于是**一门课的 key 可能是另一门课 key 的前缀**
+ *    （例如 `物理` 与 `物理|3|1,2||1,2` —— 同一门课被手工补过半段信息时就会长这样）。
+ *    只按前缀判的话，删 `物理` 会把它连同 `物理|3|1,2||1,2` 的事件一起删掉。
+ *    规则：只要库里**任何另一门课的 key** 也认领这条事件，就说明它属于那个更具体的课。
+ *    （等于"最长匹配优先"，和路由/前缀匹配的常规做法一致。）
+ */
+export function courseEventIdsOf(db, courseKey) {
+  const key = courseKey == null ? '' : String(courseKey);
+  const others = (db && db.courses ? db.courses : [])
+    .map((c) => String(c.key))
+    .filter((k) => k && k !== key);
+  return ((db && db.events) || [])
+    .filter((e) => isCourseEventOf(e, key) && !others.some((k) => isCourseEventOf(e, k)))
+    .map((e) => e.id);
+}
+
+/**
+ * 删除一门课：**课程记录 + 它的全部伴生事件**一起删掉。
+ *
+ * 为什么必须一起删（不能只删 `courses` 里那一行）：
+ *   课表视图、气泡区、提醒、日历全都是从 `events` 读的；只删课程记录的话，
+ *   格子/气泡里那节课**照旧显示、照旧提醒** —— 用户看到的就是"我删了它还在"。
+ *
+ * ⚠️ 回收语义：**跟随既有范式 = 硬删 + 墓碑**，不做"移入回收站"。
+ *    查过了：本项目的「回收站」(`core/recycle.js` / `/api/recycle` / `recycle-badge`)
+ *    是**戳破的泡泡**的账本（`popped` / `done`），跟"删除"不是一回事；
+ *    而删除的既有范式就是 `deleteEvent`：从数组里 splice 掉，
+ *    再用 `markDeleted` 记一条**墓碑**（`{at, category}`）——
+ *    墓碑是同步（4c）能区分"我删了"和"对方没有"的唯一依据，不记的话
+ *    下一次同步对方会把删掉的课**合回来**。
+ *    所以这里照做：删记录 + 给课程和每条伴生事件各记一块墓碑
+ *    （事件的 category 必须是 `courses`：按类别筛选同步时，
+ *     墓碑不分类别会导致"只同步课表"时把气泡的墓碑发出去/把课表墓碑漏发）。
+ *
+ * 可回滚性：墓碑 + 幂等导入 = **重新导入同一份课表就能把这门课加回来**
+ *   （`importCourses` 会按同一个 key 覆盖/合并，并撤销课程墓碑，见那里的"复活"注释）。
+ *
+ * 删除容器时的子气泡放出规则与 `deleteEvent` 一致：直接子级放出一级，不连带删。
+ * （课事件正常都是顶层，这一步只是为了万一有人在课事件里塞过子气泡 ——
+ *  孤儿子气泡的 `parentId` 指向一个不存在的 id，界面里会**永远看不到它**。）
+ *
+ * @returns {{ok:boolean, key:string, title:string, removedEvents:string[]}}
+ */
+export function deleteCourse(db, courseKey, now) {
+  const key = courseKey == null ? '' : String(courseKey);
+  const courses = db.courses || (db.courses = []);
+  const idx = courses.findIndex((c) => String(c.key) === key);
+  if (idx < 0) throw courseNotFound();
+
+  const at = isoNow(now);
+  const victim = courses[idx];
+  const events = db.events || (db.events = []);
+  const removedIds = new Set(courseEventIdsOf(db, key));
+  const removed = events.filter((e) => removedIds.has(e.id));
+
+  // ① 先把子气泡放出一级（在删之前算好"被删那层的父级"）——与 deleteEvent 同规矩
+  const grandparentOf = new Map(removed.map((e) => [e.id, e.parentId || null]));
+  for (const e of events) {
+    if (grandparentOf.has(e.id)) continue;                 // 它自己就要被删
+    if (e.parentId && grandparentOf.has(e.parentId)) {
+      e.parentId = grandparentOf.get(e.parentId);
+      e.updatedAt = at;
+    }
+  }
+
+  // ② 删课程记录与伴生事件
+  courses.splice(idx, 1);
+  db.events = events.filter((e) => !removedIds.has(e.id));
+
+  // ③ 墓碑（同步的依据，见上面的长注释）
+  markDeleted(db, 'courses', key, at, 'courses');
+  for (const e of removed) markDeleted(db, 'events', e.id, at, 'courses');
+
+  return {
+    ok: true,
+    key,
+    title: victim.title || '',
+    removedEvents: removed.map((e) => e.id),
+  };
+}
+
 /** 清空全部日程（保留课程记录时可传 keepCourses）。同样要记墓碑（4c） */
 export function clearEvents(db, { keepCourses = false } = {}, now) {
   const at = isoNow(now);
@@ -936,10 +1078,148 @@ export function restoreBackup(db, payload) {
   db.settings = { ...db.settings, ...(payload.settings || {}) };
   db.events = payload.events;
   db.courses = Array.isArray(payload.courses) ? payload.courses : [];
+  // 闹钟也一起恢复（有就恢复、没有就留空）。
+  // ⚠️ 必须显式写这一行：备份是**权威快照**，漏掉一个集合的后果是
+  //    "恢复完备份，我的闹钟全没了"，而用户只会觉得是恢复功能坏了。
+  db.alarms = Array.isArray(payload.alarms) ? payload.alarms.map((a) => normalizeAlarm(a)) : [];
   // 备份是**权威快照**：它里面没有的，就是没的。旧墓碑留着会在同步时
   // 把刚恢复出来的东西又删掉（"恢复完立刻消失"），所以清空。
   db.tombstones = { events: {}, courses: {} };
-  return { events: db.events.length, courses: db.courses.length };
+  return { events: db.events.length, courses: db.courses.length, alarms: db.alarms.length };
+}
+
+// ---------------------------------------------------------------------------
+// 闹钟（计时器 / 定时器）
+//
+// ⚠️ 三条设计决定，写在这里是因为它们**看起来都像"少做了一步"**：
+//
+//   ① **不记墓碑**。闹钟不进同步（core/sync.js 只同步 events + courses），
+//      而墓碑的全部意义就是"让合并能区分'对方没有'和'我删了'"。
+//      没有合并，墓碑就是纯垃圾 —— 记了反而会误导下一个人以为闹钟是同步的。
+//
+//   ② **不做离线队列**。闹钟的写操作走和 events 一样的 `writeThrough`，
+//      但"离线时新建一条闹钟"没有任何意义：闹钟的价值在于**交给系统排程**，
+//      而离线时 iOS 壳那边也排不了（网页那句"排好了"会是假的）。
+//      所以联网失败时照实报错（见 web/adapter/store.js 的 saveAlarm）。
+//
+//   ③ **id 由调用方给**（和 events 一样）。客户端先生成 id 才能做乐观更新，
+//      也让"同一条闹钟的重排"能对上号（`nextFireAt` 靠 id 去重）。
+// ---------------------------------------------------------------------------
+
+/**
+ * 新建或更新一条闹钟。**返回新数组**（不可变，照 core/contacts.js 的规矩）。
+ *
+ * 与 `upsertEvent` 的两处不同，都是故意的：
+ *   · 这里**不查重名**（闹钟没有"同一个名字只能一条"的道理，两个 7:00 是合法的）
+ *   · `createdAt` **不许被改**（用户改个时间不该让"创建于"变成今天）
+ *
+ * @param {object} db
+ * @param {object} input 至少要有 kind / 时刻或时长
+ * @param {Date} [now]
+ * @returns {object} 新数组里的那一条（调用方拿它回显）
+ */
+export function upsertAlarm(db, input, now) {
+  const at = isoNow(now);
+  const incoming = (input && typeof input === 'object') ? input : {};
+  const rawId = incoming.id != null && String(incoming.id).trim() ? String(incoming.id).trim() : '';
+  const list = Array.isArray(db.alarms) ? db.alarms : [];
+
+  // 归一化**先做**（宽宽松松地救回能救的字段），但校验读的是 **strict** 版本：
+  // ⚠️ 顺序不能反。宽松归一化会把 `atHour:99` 夹成 23，校验看到 23 就放过去了 ——
+  //    结果是"用户填 99 点，被静默存成 23 点"。必须让校验先看见原始的越界值。
+  //    两者都要：strict 那份用来报错，宽松那份用来落库（把脏字段收拾干净）。
+  const strict = normalizeAlarm(incoming, now, { strict: true });
+  const check = validateAlarm(strict);
+  if (!check.ok) {
+    // ⚠️ 抛业务错时带上 status（api.js 依赖这个约定），并且把**错误码**留在
+    //    `err.code` 上：界面按码取人话，而不是去匹配中文（一改文案就断）。
+    const first = check.errors[0];
+    throw Object.assign(new Error(first.message), {
+      status: 400, code: first.code, errors: check.errors,
+    });
+  }
+  const normalized = normalizeAlarm(strict, now);
+
+  if (rawId) {
+    const idx = list.findIndex((a) => a && String(a.id) === rawId);
+    if (idx >= 0) {
+      const prev = list[idx];
+      const next = {
+        ...normalized,
+        id: rawId,
+        // 创建时间永远是第一次那条的（照 contacts.upsertContact 的规矩）。
+        // ⚠️ 用 isoNow 而不是 `new Date(...)`：库里那份可能是老格式的字符串，
+        //    isoNow 对"已经是字符串"的情况原样返回，不会把它改成别的时区写法。
+        createdAt: prev.createdAt ? isoNow(prev.createdAt) : normalized.createdAt,
+        updatedAt: at,
+      };
+      // ⚠️ 只换掉目标那一条，其余**逐条引用不变**：
+      //    这条断言由 tools/alarms.test.mjs 钉着（"只动目标那一条"）。
+      //    写成 `list.map(a => ({...a}))` 也能跑，但会让"没动的那条"也被换新对象 ——
+      //    界面据此做的"只重画这一行"就全失效了，而且这种退化没人看得出来。
+      return { alarms: list.map((a, i) => (i === idx ? next : a)), alarm: next };
+    }
+  }
+
+  if (list.length >= ALARM_LIMIT) {
+    throw Object.assign(
+      new Error(`最多只能有 ${ALARM_LIMIT} 条闹钟，先删掉几条再加`),
+      { status: 400, code: 'ALARM_LIMIT' },
+    );
+  }
+
+  const created = { ...normalized, id: rawId || normalized.id, createdAt: at, updatedAt: at };
+  return { alarms: [...list, created], alarm: created };
+}
+
+/**
+ * 删一条闹钟。**返回新数组**。
+ *
+ * ⚠️ 删不存在的 id **不抛错**、原样返回一份副本（照 contacts.removeContact 的规矩）：
+ *    "我这边删了、那边也删了"是正常情况，抛错只会把一次无辜的操作变成红框。
+ */
+export function removeAlarm(db, id, now) {
+  void now;   // 参数保留（签名契约，和 removeContact 同样处理）
+  const list = Array.isArray(db.alarms) ? db.alarms : [];
+  const key = id == null ? '' : String(id);
+  if (!key) return list.slice();
+  return list.filter((a) => !(a && String(a.id) === key));
+}
+
+/**
+ * 开关一条闹钟。
+ *
+ * ⚠️ 为什么单独一个函数（而不是让界面 patch `{enabled:false}`）：
+ *    · 开关是**最高频**的操作，它必须只动那一条的 `enabled` + `updatedAt`；
+ *    · 走通用 upsert 的话，界面得把整条闹钟再发一遍 —— 多一次"界面手上的副本
+ *      和服务端不一致"的机会（比如在另一台设备上改过时刻），而开关本身
+ *      根本不该碰时刻。
+ *   关掉一条**正在跑的计时器**时，顺手把 `startedAt` 清掉：留着它，
+ *   重新打开会立刻"已结束"（因为 startedAt + duration 早就过去了）。
+ */
+export function toggleAlarm(db, id, enabled, now) {
+  const at = isoNow(now);
+  const list = Array.isArray(db.alarms) ? db.alarms : [];
+  const key = id == null ? '' : String(id);
+  const idx = list.findIndex((a) => a && String(a.id) === key);
+  if (idx < 0) {
+    throw Object.assign(new Error('这条闹钟不在了（可能已被删除）'), {
+      status: 404, code: 'ALARM_NOT_FOUND',
+    });
+  }
+  const prev = normalizeAlarm(list[idx], now);
+  const want = enabled !== false;
+  const next = {
+    ...prev,
+    enabled: want,
+    // ⚠️ 计时器的 startedAt **永远不为"关着的那条"保留**：
+    //    留着它，用户重新打开时会看到一个"已结束"的计时器（startedAt + duration
+    //    早就过去了）—— 而用户的意思明明是"我要用这个计时器"。
+    //    真开始计时是另一个动作（UI 按「开始」→ 写 startedAt），不该由开关代劳。
+    startedAt: prev.kind === 'timer' ? null : prev.startedAt,
+    updatedAt: at,
+  };
+  return { alarms: list.map((a, i) => (i === idx ? next : a)), alarm: next };
 }
 
 // ---------------------------------------------------------------------------
